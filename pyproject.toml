@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 sau = "sau_cli:main"
 
+[project.gui-scripts]
+sau-desktop = "sau_desktop:main"
+
 [project.optional-dependencies]
 desktop = [
   "Flask[async]==3.1.1",
@@ -37,7 +40,17 @@ web = [
 package = true
 
 [tool.setuptools]
-py-modules = ["conf", "sau_browser_runtime", "sau_cli"]
+py-modules = [
+  "conf",
+  "sau_backend",
+  "sau_browser_runtime",
+  "sau_cli",
+  "sau_desktop",
+  "sau_desktop_api",
+  "sau_desktop_service",
+  "sau_media_validation",
+  "sau_runtime",
+]
 include-package-data = true
 
 [tool.setuptools.packages.find]
