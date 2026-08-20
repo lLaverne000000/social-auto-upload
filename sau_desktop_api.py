@@ -20,6 +20,7 @@ from flask import Flask, Response, jsonify, make_response, request, send_file
 
 from sau_cli import build_parser, dispatch
 from sau_desktop_service import JobStatus, PublishRequest
+from sau_media_validation import SAFE_MEDIA_TYPES, detect_media_type
 from sau_runtime import RuntimePaths, use_runtime_paths
 from utils.risk_control import read_publish_safety_status
 
@@ -30,18 +31,7 @@ _GUI_PLATFORMS = frozenset({"douyin", "kuaishou", "tencent", "xiaohongshu"})
 _ACCOUNT_NAME = re.compile(r"^[\w .@+-]{1,80}$")
 _MATERIAL_ID = re.compile(r"^[0-9a-f]{32}$")
 _TERMINAL_LOGIN_STATES = frozenset({"succeeded", "failed", "blocked"})
-_SAFE_MEDIA_TYPES = {
-    ".gif": "image/gif",
-    ".jpeg": "image/jpeg",
-    ".jpg": "image/jpeg",
-    ".m4v": "video/x-m4v",
-    ".mov": "video/quicktime",
-    ".mp4": "video/mp4",
-    ".png": "image/png",
-    ".webm": "video/webm",
-    ".webp": "image/webp",
-}
-_PREVIEW_MEDIA_TYPES = frozenset(_SAFE_MEDIA_TYPES.values())
+_PREVIEW_MEDIA_TYPES = frozenset(SAFE_MEDIA_TYPES.values())
 
 
 def _success(data: Any, status: int = 200):
@@ -290,30 +280,6 @@ def _original_filename(raw_name: str) -> str:
     return name[:200] or "material"
 
 
-def _detected_media_type(filename: str, prefix: bytes) -> str | None:
-    suffix = Path(filename).suffix.lower()
-    expected = _SAFE_MEDIA_TYPES.get(suffix)
-    if expected is None:
-        return None
-    if suffix == ".png":
-        valid = prefix.startswith(b"\x89PNG\r\n\x1a\n")
-    elif suffix in {".jpg", ".jpeg"}:
-        valid = prefix.startswith(b"\xff\xd8\xff")
-    elif suffix == ".gif":
-        valid = prefix.startswith((b"GIF87a", b"GIF89a"))
-    elif suffix == ".webp":
-        valid = (
-            len(prefix) >= 12
-            and prefix.startswith(b"RIFF")
-            and prefix[8:12] == b"WEBP"
-        )
-    elif suffix == ".webm":
-        valid = prefix.startswith(b"\x1a\x45\xdf\xa3")
-    else:
-        valid = len(prefix) >= 12 and prefix[4:8] == b"ftyp"
-    return expected if valid else None
-
-
 def _media_path(paths: RuntimePaths, value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("mediaFile is required")
@@ -501,10 +467,11 @@ class _LoginJobManager:
                 self._queue.task_done()
 
     def _run(self, job_id: str) -> None:
-        self._set(job_id, status=JobStatus.WAITING_FOR_LOGIN.value)
         try:
+            current = self._begin(job_id)
+            if current is None:
+                return
             with use_runtime_paths(self._paths):
-                current = self.get(job_id)
                 args = self._parser_factory().parse_args([
                     current.platform,
                     "login",
@@ -512,6 +479,13 @@ class _LoginJobManager:
                     current.account_name,
                     "--headed",
                 ])
+                with self._lock:
+                    current = self._jobs[job_id]
+                    if (
+                        self._shutting_down
+                        or current.status in _TERMINAL_LOGIN_STATES
+                    ):
+                        return
                 result = self._dispatcher(args)
                 if inspect.isawaitable(result):
                     result = asyncio.run(result)
@@ -550,11 +524,7 @@ class _LoginJobManager:
                 return
             self._shutting_down = True
             for job_id in tuple(self._running):
-                self._set(
-                    job_id,
-                    status=JobStatus.BLOCKED.value,
-                    message="Login was cancelled during application shutdown.",
-                )
+                self._block(job_id)
         while True:
             try:
                 job_id = self._queue.get_nowait()
@@ -572,12 +542,36 @@ class _LoginJobManager:
                 break
 
     def _cancel(self, job_id: str) -> None:
-        self._set(
-            job_id,
-            status=JobStatus.BLOCKED.value,
-            message="Login was cancelled during application shutdown.",
-        )
+        self._block(job_id)
         self._retain_completed(job_id)
+
+    def _begin(self, job_id: str) -> _LoginJob | None:
+        with self._lock:
+            current = self._jobs[job_id]
+            if self._shutting_down or current.status in _TERMINAL_LOGIN_STATES:
+                return None
+            updated = replace(
+                current,
+                status=JobStatus.WAITING_FOR_LOGIN.value,
+                message="",
+                result_code=None,
+                updated_at=time.time(),
+            )
+            self._jobs[job_id] = updated
+            return replace(updated)
+
+    def _block(self, job_id: str) -> None:
+        with self._lock:
+            current = self._jobs.get(job_id)
+            if current is None or current.status in _TERMINAL_LOGIN_STATES:
+                return
+            self._jobs[job_id] = replace(
+                current,
+                status=JobStatus.BLOCKED.value,
+                message="Login was cancelled during application shutdown.",
+                result_code=None,
+                updated_at=time.time(),
+            )
 
     def _finish(
         self,
@@ -588,7 +582,11 @@ class _LoginJobManager:
         result_code: int | None = None,
     ) -> None:
         with self._lock:
-            if self._shutting_down:
+            current = self._jobs[job_id]
+            if (
+                self._shutting_down
+                or current.status in _TERMINAL_LOGIN_STATES
+            ):
                 return
             self._set(
                 job_id,
@@ -753,12 +751,7 @@ def create_desktop_app(
             return _failure("invalid_request", "A material file is required.", 400)
         original_name = _original_filename(uploaded.filename)
         suffix = Path(original_name).suffix.lower()
-        try:
-            prefix = uploaded.stream.read(32)
-            uploaded.stream.seek(0)
-        except (OSError, ValueError):
-            return _failure("unsupported_media", "Material type is not supported.", 415)
-        media_type = _detected_media_type(original_name, prefix)
+        media_type = detect_media_type(original_name, uploaded.stream)
         if media_type is None:
             return _failure("unsupported_media", "Material type is not supported.", 415)
         material_id = uuid.uuid4().hex

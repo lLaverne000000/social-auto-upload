@@ -5,10 +5,12 @@ import json
 import os
 import runpy
 import sqlite3
+import struct
 import tempfile
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -55,7 +57,70 @@ class DesktopApiTests(unittest.TestCase):
 
     @staticmethod
     def _mp4_bytes():
-        return b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
+        def box(box_type, payload):
+            return struct.pack(">I4s", len(payload) + 8, box_type) + payload
+
+        ftyp = box(b"ftyp", b"isom\x00\x00\x00\x00isommp42")
+        moov = box(b"moov", box(b"mvhd", b"\x00" * 20))
+        mdat = box(b"mdat", b"\x00\x00\x01\x09")
+        return ftyp + moov + mdat
+
+    @staticmethod
+    def _png_bytes():
+        def chunk(chunk_type, payload):
+            body = chunk_type + payload
+            return (
+                struct.pack(">I", len(payload))
+                + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+            )
+
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+            + chunk(b"IEND", b"")
+        )
+
+    @staticmethod
+    def _jpeg_bytes():
+        dqt = b"\x00" + bytes(range(1, 65))
+        sof = b"\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+        sos = b"\x01\x01\x00\x00\x3f\x00"
+        return (
+            b"\xff\xd8"
+            + b"\xff\xdb" + struct.pack(">H", len(dqt) + 2) + dqt
+            + b"\xff\xc0" + struct.pack(">H", len(sof) + 2) + sof
+            + b"\xff\xda" + struct.pack(">H", len(sos) + 2) + sos
+            + b"\x00\xff\xd9"
+        )
+
+    @staticmethod
+    def _gif_bytes():
+        return bytes.fromhex(
+            "47494638396101000100800000ffffff000000"
+            "2c00000000010001000002024401003b"
+        )
+
+    @staticmethod
+    def _webp_bytes():
+        chunk = b"VP8L" + struct.pack("<I", 5) + b"\x2f\x00\x00\x00\x00" + b"\x00"
+        return b"RIFF" + struct.pack("<I", len(chunk) + 4) + b"WEBP" + chunk
+
+    @staticmethod
+    def _webm_bytes():
+        doc_type = b"\x42\x82\x84webm"
+        ebml = b"\x1a\x45\xdf\xa3" + bytes([0x80 | len(doc_type)]) + doc_type
+        tracks = b"\x16\x54\xae\x6b\x80"
+        cluster = b"\x1f\x43\xb6\x75\x80"
+        segment_body = tracks + cluster
+        segment = (
+            b"\x18\x53\x80\x67"
+            + bytes([0x80 | len(segment_body)])
+            + segment_body
+        )
+        return ebml + segment
 
     def test_import_does_not_bind_a_socket(self):
         with patch("socket.socket.bind", side_effect=AssertionError("socket opened")):
@@ -490,6 +555,49 @@ class DesktopApiTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             manager.submit("douyin", "after-shutdown")
 
+    def test_login_shutdown_wins_before_worker_enters_dispatch(self):
+        worker_ready = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        dispatcher_started = threading.Event()
+
+        def dispatcher(_args):
+            dispatcher_started.set()
+            return 0
+
+        app = create_desktop_app(
+            paths=self.paths,
+            session_token="secret",
+            jobs=self.jobs,
+            login_dispatcher=dispatcher,
+        )
+        manager = app.extensions["sau_login_jobs"]
+        original_run = manager._run
+
+        def paused_run(job_id):
+            worker_ready.set()
+            release_worker.wait(1)
+            try:
+                original_run(job_id)
+            finally:
+                worker_finished.set()
+
+        manager._run = paused_run
+        submitted = manager.submit("douyin", "shutdown-window")
+        self.assertTrue(worker_ready.wait(1))
+
+        started_at = time.monotonic()
+        manager.shutdown()
+        elapsed = time.monotonic() - started_at
+        release_worker.set()
+        self.assertTrue(worker_finished.wait(1))
+        self.assertLess(elapsed, 0.2)
+        self.assertFalse(dispatcher_started.is_set())
+        self.assertEqual(
+            manager.get(submitted.id).status,
+            JobStatus.BLOCKED.value,
+        )
+
     def test_login_manager_retains_at_most_two_hundred_completed_jobs(self):
         app = create_desktop_app(
             paths=self.paths,
@@ -699,6 +807,49 @@ class DesktopApiTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 415)
         self.assertEqual(list(self.paths.media_dir.iterdir()), [])
+
+    def test_material_upload_rejects_truncated_or_structurally_fake_media(self):
+        samples = (
+            ("truncated.jpg", b"\xff\xd8\xff"),
+            ("truncated.png", b"\x89PNG\r\n\x1a\n"),
+            ("truncated.gif", b"GIF89a"),
+            ("truncated.webp", b"RIFF\x04\x00\x00\x00WEBP"),
+            ("truncated.webm", b"\x1a\x45\xdf\xa3"),
+            (
+                "active.mp4",
+                b"\x00\x00\x00\x18ftyp"
+                b"<!doctype html><script>alert(1)</script>",
+            ),
+        )
+        for filename, payload in samples:
+            with self.subTest(filename=filename):
+                response = self.client.post(
+                    "/api/v1/materials",
+                    data={"file": (io.BytesIO(payload), filename)},
+                    content_type="multipart/form-data",
+                    headers=self._authorize(),
+                )
+                self.assertEqual(response.status_code, 415)
+        self.assertEqual(list(self.paths.media_dir.iterdir()), [])
+
+    def test_material_upload_accepts_structurally_valid_media_fixtures(self):
+        samples = (
+            ("valid.mp4", self._mp4_bytes()),
+            ("valid.png", self._png_bytes()),
+            ("valid.jpg", self._jpeg_bytes()),
+            ("valid.gif", self._gif_bytes()),
+            ("valid.webp", self._webp_bytes()),
+            ("valid.webm", self._webm_bytes()),
+        )
+        for filename, payload in samples:
+            with self.subTest(filename=filename):
+                response = self.client.post(
+                    "/api/v1/materials",
+                    data={"file": (io.BytesIO(payload), filename)},
+                    content_type="multipart/form-data",
+                    headers=self._authorize(),
+                )
+                self.assertEqual(response.status_code, 201)
 
     def test_material_delete_restores_file_on_database_failure(self):
         upload = self.client.post(
