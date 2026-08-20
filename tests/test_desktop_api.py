@@ -126,6 +126,85 @@ class DesktopApiTests(unittest.TestCase):
         with patch("socket.socket.bind", side_effect=AssertionError("socket opened")):
             importlib.reload(sau_desktop_api)
 
+    def test_frontend_uses_only_same_origin_private_api_contract(self):
+        frontend_root = Path("sau_frontend")
+        request_source = (frontend_root / "src/utils/request.js").read_text(
+            encoding="utf-8"
+        )
+        material_source = (frontend_root / "src/api/material.js").read_text(
+            encoding="utf-8"
+        )
+        publish_source = (frontend_root / "src/views/PublishCenter.vue").read_text(
+            encoding="utf-8"
+        )
+        all_sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((frontend_root / "src").rglob("*"))
+            if path.is_file()
+        )
+
+        self.assertIn("baseURL: '/'", request_source)
+        self.assertIn("withCredentials: true", request_source)
+        self.assertIn("'/api/v1/materials'", material_source)
+        self.assertIn("'/api/v1/publish'", publish_source)
+        self.assertIn("materialId:", publish_source)
+        for retired in (
+            "http://localhost:5409",
+            "/postVideo",
+            "/uploadSave",
+            "/getFile",
+            "/getFiles",
+            "/deleteFile",
+            "/uploadCookie",
+            "/downloadCookie",
+        ):
+            self.assertNotIn(retired, all_sources)
+
+    def test_frontend_publish_job_requires_terminal_poll_or_explicit_confirmation(self):
+        publish_source = Path(
+            "sau_frontend/src/views/PublishCenter.vue"
+        ).read_text(encoding="utf-8")
+
+        for status, message in (
+            ("queued", "任务已排队"),
+            ("running", "正在执行发布"),
+            ("waiting-for-login", "等待账号登录"),
+            ("waiting-for-confirmation", "等待你的发布确认"),
+            ("succeeded", "发布成功"),
+            ("failed", "发布失败"),
+            ("blocked", "已被本地安全控制阻止"),
+        ):
+            self.assertIn(f"'{status}':", publish_source)
+            self.assertIn(message, publish_source)
+        self.assertIn("/api/v1/jobs/${job.id}", publish_source)
+        self.assertIn("/api/v1/jobs/${job.id}/confirm", publish_source)
+        self.assertIn("v-if=\"job.status === 'waiting-for-confirmation'\"", publish_source)
+        self.assertIn("automaticPublish: form.automaticPublish", publish_source)
+        self.assertIn("onBeforeUnmount(clearJobPoll)", publish_source)
+
+    def test_frontend_login_uses_post_then_relative_status_event_stream(self):
+        account_source = Path(
+            "sau_frontend/src/views/AccountManagement.vue"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("http.post('/api/v1/login'", account_source)
+        self.assertIn(
+            "new EventSource(`/api/v1/login/${jobId}/events`)",
+            account_source,
+        )
+        self.assertIn("addEventListener('status'", account_source)
+        self.assertIn("onBeforeUnmount(closeSSEConnection)", account_source)
+        self.assertNotIn("/login?", account_source)
+
+    def test_frontend_keeps_persistent_cross_computer_warning(self):
+        app_source = Path("sau_frontend/src/App.vue").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "同一账号不要在多台电脑同时发布。本机发布锁不能协调其他电脑。",
+            app_source,
+        )
+        self.assertIn('role="alert"', app_source)
+
     def test_index_sets_strict_http_only_session_cookie(self):
         response = self.client.get("/")
 

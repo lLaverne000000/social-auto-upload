@@ -51,6 +51,9 @@
           </div>
         </el-header>
         <el-main>
+          <div class="cross-computer-warning" role="alert">
+            同一账号不要在多台电脑同时发布。本机发布锁不能协调其他电脑。
+          </div>
           <router-view />
         </el-main>
       </el-container>
@@ -194,5 +197,15 @@ const toggleSidebar = () => {
   background-color: $bg-color-page;
   padding: 20px;
   overflow-y: auto;
+}
+
+.cross-computer-warning {
+  margin-bottom: 18px;
+  padding: 12px 16px;
+  border: 1px solid #e6a23c;
+  border-radius: 6px;
+  background: #fdf6ec;
+  color: #8a5a00;
+  font-weight: 600;
 }
 </style>

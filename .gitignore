@@ -179,6 +179,7 @@ cookies
 dist/
 node_modules/
 package-lock.json
+!sau_frontend/package-lock.json
 
 # database
 db/database.db
