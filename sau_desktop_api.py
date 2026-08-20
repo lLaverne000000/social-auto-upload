@@ -10,9 +10,9 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -29,8 +29,19 @@ _RETIRED_LEGACY_PATHS = frozenset({"/postVideo", "/postVideoBatch"})
 _GUI_PLATFORMS = frozenset({"douyin", "kuaishou", "tencent", "xiaohongshu"})
 _ACCOUNT_NAME = re.compile(r"^[\w .@+-]{1,80}$")
 _MATERIAL_ID = re.compile(r"^[0-9a-f]{32}$")
-_SAFE_SUFFIX = re.compile(r"^\.[a-z0-9]{1,12}$")
 _TERMINAL_LOGIN_STATES = frozenset({"succeeded", "failed", "blocked"})
+_SAFE_MEDIA_TYPES = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".m4v": "video/x-m4v",
+    ".mov": "video/quicktime",
+    ".mp4": "video/mp4",
+    ".png": "image/png",
+    ".webm": "video/webm",
+    ".webp": "image/webp",
+}
+_PREVIEW_MEDIA_TYPES = frozenset(_SAFE_MEDIA_TYPES.values())
 
 
 def _success(data: Any, status: int = 200):
@@ -185,9 +196,18 @@ def _initialize_database(paths: RuntimePaths) -> None:
                 original_name TEXT NOT NULL,
                 stored_name TEXT NOT NULL UNIQUE,
                 size_bytes INTEGER NOT NULL,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                media_type TEXT
             )
         """)
+        material_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(desktop_materials)")
+        }
+        if "media_type" not in material_columns:
+            connection.execute(
+                "ALTER TABLE desktop_materials ADD COLUMN media_type TEXT"
+            )
 
 
 def _account_name(value: Any) -> str:
@@ -222,7 +242,7 @@ def _material_record(paths: RuntimePaths, material_id: Any) -> dict[str, Any]:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
-            SELECT id, original_name, stored_name, size_bytes, created_at
+            SELECT id, original_name, stored_name, size_bytes, created_at, media_type
             FROM desktop_materials WHERE id = ?
             """,
             (material_id,),
@@ -232,7 +252,7 @@ def _material_record(paths: RuntimePaths, material_id: Any) -> dict[str, Any]:
     return dict(row)
 
 
-def _material_file(paths: RuntimePaths, record: dict[str, Any]) -> Path:
+def _material_storage_path(paths: RuntimePaths, record: dict[str, Any]) -> Path:
     stored_name = record.get("stored_name")
     if not isinstance(stored_name, str) or not stored_name:
         raise KeyError("invalid stored material")
@@ -244,6 +264,11 @@ def _material_file(paths: RuntimePaths, record: dict[str, Any]) -> Path:
         )
     except ValueError as exc:
         raise KeyError("invalid stored material") from exc
+    return material_file
+
+
+def _material_file(paths: RuntimePaths, record: dict[str, Any]) -> Path:
+    material_file = _material_storage_path(paths, record)
     if not material_file.is_file():
         raise KeyError("material file missing")
     return material_file
@@ -263,6 +288,30 @@ def _original_filename(raw_name: str) -> str:
     name = Path(normalized).name.strip()
     name = "".join(character for character in name if ord(character) >= 32)
     return name[:200] or "material"
+
+
+def _detected_media_type(filename: str, prefix: bytes) -> str | None:
+    suffix = Path(filename).suffix.lower()
+    expected = _SAFE_MEDIA_TYPES.get(suffix)
+    if expected is None:
+        return None
+    if suffix == ".png":
+        valid = prefix.startswith(b"\x89PNG\r\n\x1a\n")
+    elif suffix in {".jpg", ".jpeg"}:
+        valid = prefix.startswith(b"\xff\xd8\xff")
+    elif suffix == ".gif":
+        valid = prefix.startswith((b"GIF87a", b"GIF89a"))
+    elif suffix == ".webp":
+        valid = (
+            len(prefix) >= 12
+            and prefix.startswith(b"RIFF")
+            and prefix[8:12] == b"WEBP"
+        )
+    elif suffix == ".webm":
+        valid = prefix.startswith(b"\x1a\x45\xdf\xa3")
+    else:
+        valid = len(prefix) >= 12 and prefix[4:8] == b"ftyp"
+    return expected if valid else None
 
 
 def _media_path(paths: RuntimePaths, value: Any) -> Path:
@@ -378,15 +427,23 @@ class _LoginJobManager:
         self._paths = paths
         self._parser_factory = parser_factory
         self._dispatcher = dispatcher
-        self._executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="sau-login",
-        )
         self._lock = threading.RLock()
         self._jobs: dict[str, _LoginJob] = {}
         self._active: dict[tuple[str, str], str] = {}
         self._completed: deque[str] = deque()
+        self._queue: Queue[str | None] = Queue(maxsize=20)
+        self._running: set[str] = set()
         self._shutting_down = False
+        self._workers = tuple(
+            threading.Thread(
+                target=self._worker,
+                name=f"sau-login-{index + 1}",
+                daemon=True,
+            )
+            for index in range(2)
+        )
+        for worker in self._workers:
+            worker.start()
 
     def submit(self, platform: str, account_name: str) -> _LoginJob:
         key = platform, account_name
@@ -408,7 +465,12 @@ class _LoginJobManager:
             )
             self._jobs[job.id] = job
             self._active[key] = job.id
-            self._executor.submit(self._run, job.id)
+            try:
+                self._queue.put_nowait(job.id)
+            except Full as exc:
+                self._jobs.pop(job.id, None)
+                self._active.pop(key, None)
+                raise RuntimeError("login queue is full") from exc
         return job
 
     def get(self, job_id: str) -> _LoginJob:
@@ -417,6 +479,26 @@ class _LoginJobManager:
                 return replace(self._jobs[job_id])
             except KeyError as exc:
                 raise KeyError(job_id) from exc
+
+    def _worker(self) -> None:
+        while True:
+            job_id = self._queue.get()
+            try:
+                if job_id is None:
+                    return
+                with self._lock:
+                    shutting_down = self._shutting_down
+                    if not shutting_down:
+                        self._running.add(job_id)
+                if shutting_down:
+                    self._cancel(job_id)
+                else:
+                    self._run(job_id)
+            finally:
+                if job_id is not None:
+                    with self._lock:
+                        self._running.discard(job_id)
+                self._queue.task_done()
 
     def _run(self, job_id: str) -> None:
         self._set(job_id, status=JobStatus.WAITING_FOR_LOGIN.value)
@@ -434,27 +516,27 @@ class _LoginJobManager:
                 if inspect.isawaitable(result):
                     result = asyncio.run(result)
             if type(result) is int and result == 0:
-                self._set(
+                self._finish(
                     job_id,
                     status=JobStatus.SUCCEEDED.value,
                     message="completed",
                     result_code=0,
                 )
             else:
-                self._set(
+                self._finish(
                     job_id,
                     status=JobStatus.FAILED.value,
                     message="Login did not complete successfully.",
                     result_code=result if type(result) is int else None,
                 )
         except Exception:
-            self._set(
+            self._finish(
                 job_id,
                 status=JobStatus.FAILED.value,
                 message="Login failed. Check local application logs for details.",
             )
         except SystemExit:
-            self._set(
+            self._finish(
                 job_id,
                 status=JobStatus.FAILED.value,
                 message="Login request validation failed.",
@@ -467,7 +549,53 @@ class _LoginJobManager:
             if self._shutting_down:
                 return
             self._shutting_down = True
-        self._executor.shutdown(wait=True, cancel_futures=False)
+            for job_id in tuple(self._running):
+                self._set(
+                    job_id,
+                    status=JobStatus.BLOCKED.value,
+                    message="Login was cancelled during application shutdown.",
+                )
+        while True:
+            try:
+                job_id = self._queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if job_id is not None:
+                    self._cancel(job_id)
+            finally:
+                self._queue.task_done()
+        for _worker in self._workers:
+            try:
+                self._queue.put_nowait(None)
+            except Full:
+                break
+
+    def _cancel(self, job_id: str) -> None:
+        self._set(
+            job_id,
+            status=JobStatus.BLOCKED.value,
+            message="Login was cancelled during application shutdown.",
+        )
+        self._retain_completed(job_id)
+
+    def _finish(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        message: str = "",
+        result_code: int | None = None,
+    ) -> None:
+        with self._lock:
+            if self._shutting_down:
+                return
+            self._set(
+                job_id,
+                status=status,
+                message=message,
+                result_code=result_code,
+            )
 
     def _set(
         self,
@@ -625,8 +753,14 @@ def create_desktop_app(
             return _failure("invalid_request", "A material file is required.", 400)
         original_name = _original_filename(uploaded.filename)
         suffix = Path(original_name).suffix.lower()
-        if not _SAFE_SUFFIX.fullmatch(suffix):
-            suffix = ""
+        try:
+            prefix = uploaded.stream.read(32)
+            uploaded.stream.seek(0)
+        except (OSError, ValueError):
+            return _failure("unsupported_media", "Material type is not supported.", 415)
+        media_type = _detected_media_type(original_name, prefix)
+        if media_type is None:
+            return _failure("unsupported_media", "Material type is not supported.", 415)
         material_id = uuid.uuid4().hex
         stored_name = f"{material_id}{suffix}"
         destination: Path | None = None
@@ -647,10 +781,17 @@ def create_desktop_app(
                 connection.execute(
                     """
                     INSERT INTO desktop_materials
-                        (id, original_name, stored_name, size_bytes, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (id, original_name, stored_name, size_bytes, created_at, media_type)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (material_id, original_name, stored_name, size_bytes, created_at),
+                    (
+                        material_id,
+                        original_name,
+                        stored_name,
+                        size_bytes,
+                        created_at,
+                        media_type,
+                    ),
                 )
         except Exception:
             if destination is not None:
@@ -673,7 +814,7 @@ def create_desktop_app(
                 connection.row_factory = sqlite3.Row
                 rows = connection.execute(
                     """
-                    SELECT id, original_name, stored_name, size_bytes, created_at
+                    SELECT id, original_name, stored_name, size_bytes, created_at, media_type
                     FROM desktop_materials ORDER BY created_at, id
                     """
                 ).fetchall()
@@ -687,12 +828,20 @@ def create_desktop_app(
             material_file = _material_file(paths, record)
         except KeyError:
             return _failure("not_found", "Material not found.", 404)
-        return send_file(
+        media_type = record.get("media_type")
+        if not download and media_type not in _PREVIEW_MEDIA_TYPES:
+            return _failure("unsupported_media", "Material preview is not supported.", 415)
+        response = make_response(send_file(
             material_file,
             as_attachment=download,
             download_name=record["original_name"],
+            mimetype="application/octet-stream" if download else media_type,
             max_age=0,
-        )
+        ))
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        if not download:
+            response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        return response
 
     @app.get("/api/v1/materials/<material_id>/preview")
     def preview_material(material_id: str):
@@ -704,19 +853,48 @@ def create_desktop_app(
 
     @app.delete("/api/v1/materials/<material_id>")
     def delete_material(material_id: str):
+        tombstone: Path | None = None
+        material_file: Path | None = None
         try:
             record = _material_record(paths, material_id)
-            material_file = _material_file(paths, record)
-            material_file.unlink()
-            with sqlite3.connect(paths.database_file) as connection:
-                connection.execute(
-                    "DELETE FROM desktop_materials WHERE id = ?",
-                    (material_id,),
+            material_file = _material_storage_path(paths, record)
+            if material_file.exists():
+                if not material_file.is_file():
+                    raise KeyError("material file is invalid")
+                tombstone = material_file.with_name(
+                    f".{material_file.name}.{uuid.uuid4().hex}.deleting"
                 )
+                material_file.rename(tombstone)
         except KeyError:
             return _failure("not_found", "Material not found.", 404)
         except Exception:
             return _failure("internal_error", "Unable to delete material.", 500)
+
+        connection = sqlite3.connect(paths.database_file)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            deleted = connection.execute(
+                "DELETE FROM desktop_materials WHERE id = ?",
+                (material_id,),
+            )
+            if deleted.rowcount != 1:
+                raise KeyError(material_id)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            if tombstone is not None and material_file is not None:
+                try:
+                    tombstone.replace(material_file)
+                except OSError:
+                    pass
+            return _failure("internal_error", "Unable to delete material.", 500)
+        finally:
+            connection.close()
+        if tombstone is not None:
+            try:
+                tombstone.unlink(missing_ok=True)
+            except OSError:
+                pass
         return _success({"id": material_id, "deleted": True})
 
     @app.get("/api/v1/jobs/<job_id>")

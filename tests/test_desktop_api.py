@@ -53,6 +53,10 @@ class DesktopApiTests(unittest.TestCase):
             "contentSource": "original",
         }
 
+    @staticmethod
+    def _mp4_bytes():
+        return b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
+
     def test_import_does_not_bind_a_socket(self):
         with patch("socket.socket.bind", side_effect=AssertionError("socket opened")):
             importlib.reload(sau_desktop_api)
@@ -441,6 +445,51 @@ class DesktopApiTests(unittest.TestCase):
             release.set()
         app.extensions["sau_desktop_shutdown"]()
 
+    def test_login_shutdown_is_fast_and_cancels_queued_jobs(self):
+        release = threading.Event()
+        two_started = threading.Event()
+        third_started = threading.Event()
+        lock = threading.Lock()
+        started = 0
+
+        def dispatcher(_args):
+            nonlocal started
+            with lock:
+                started += 1
+                if started == 2:
+                    two_started.set()
+                if started == 3:
+                    third_started.set()
+            release.wait(0.5)
+            return 0
+
+        app = create_desktop_app(
+            paths=self.paths,
+            session_token="secret",
+            jobs=self.jobs,
+            login_dispatcher=dispatcher,
+        )
+        manager = app.extensions["sau_login_jobs"]
+        submitted = [
+            manager.submit("douyin", f"shutdown-{index}")
+            for index in range(3)
+        ]
+        self.assertTrue(two_started.wait(1))
+
+        started_at = time.monotonic()
+        manager.shutdown()
+        elapsed = time.monotonic() - started_at
+        release.set()
+
+        self.assertLess(elapsed, 0.2)
+        self.assertFalse(third_started.is_set())
+        self.assertEqual(
+            {manager.get(job.id).status for job in submitted},
+            {JobStatus.BLOCKED.value},
+        )
+        with self.assertRaises(RuntimeError):
+            manager.submit("douyin", "after-shutdown")
+
     def test_login_manager_retains_at_most_two_hundred_completed_jobs(self):
         app = create_desktop_app(
             paths=self.paths,
@@ -547,7 +596,7 @@ class DesktopApiTests(unittest.TestCase):
 
         upload = client.post(
             "/api/v1/materials",
-            data={"file": (io.BytesIO(b"video-bytes"), "demo.mp4")},
+            data={"file": (io.BytesIO(self._mp4_bytes()), "demo.mp4")},
             content_type="multipart/form-data",
             headers=headers,
         )
@@ -568,8 +617,14 @@ class DesktopApiTests(unittest.TestCase):
         self.assertEqual(listing.get_json()["data"]["materials"], [material])
         preview = client.get(f"/api/v1/materials/{material['id']}/preview")
         download = client.get(f"/api/v1/materials/{material['id']}/download")
-        self.assertEqual(preview.data, b"video-bytes")
-        self.assertEqual(download.data, b"video-bytes")
+        self.assertEqual(preview.data, self._mp4_bytes())
+        self.assertEqual(download.data, self._mp4_bytes())
+        self.assertEqual(preview.headers["Content-Type"], "video/mp4")
+        self.assertEqual(preview.headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("sandbox", preview.headers["Content-Security-Policy"])
+        self.assertEqual(download.headers["Content-Type"], "application/octet-stream")
+        self.assertIn("attachment", download.headers["Content-Disposition"])
+        self.assertEqual(download.headers["X-Content-Type-Options"], "nosniff")
         preview.close()
         download.close()
 
@@ -604,7 +659,7 @@ class DesktopApiTests(unittest.TestCase):
 
         upload = self.client.post(
             "/api/v1/materials",
-            data={"file": (io.BytesIO(b"safe"), "safe.mp4")},
+            data={"file": (io.BytesIO(self._mp4_bytes()), "safe.mp4")},
             content_type="multipart/form-data",
             headers=self._authorize(),
         )
@@ -625,6 +680,102 @@ class DesktopApiTests(unittest.TestCase):
 
         self.assertEqual(preview.status_code, 404)
         self.assertNotIn(b"MATERIAL-SECRET", preview.data)
+
+    def test_material_upload_rejects_active_and_disguised_content(self):
+        headers = self._authorize()
+        samples = (
+            ("payload.html", b"<!doctype html><script>alert(1)</script>"),
+            ("payload.svg", b"<svg onload='alert(1)' xmlns='http://www.w3.org/2000/svg'/>"),
+            ("disguised.mp4", b"<!doctype html><script>alert(1)</script>"),
+            ("disguised.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+        )
+        for filename, payload in samples:
+            with self.subTest(filename=filename):
+                response = self.client.post(
+                    "/api/v1/materials",
+                    data={"file": (io.BytesIO(payload), filename)},
+                    content_type="multipart/form-data",
+                    headers=headers,
+                )
+                self.assertEqual(response.status_code, 415)
+        self.assertEqual(list(self.paths.media_dir.iterdir()), [])
+
+    def test_material_delete_restores_file_on_database_failure(self):
+        upload = self.client.post(
+            "/api/v1/materials",
+            data={"file": (io.BytesIO(self._mp4_bytes()), "delete.mp4")},
+            content_type="multipart/form-data",
+            headers=self._authorize(),
+        )
+        material_id = upload.get_json()["data"]["id"]
+        with sqlite3.connect(self.paths.database_file) as connection:
+            stored_name = connection.execute(
+                "SELECT stored_name FROM desktop_materials WHERE id = ?",
+                (material_id,),
+            ).fetchone()[0]
+            connection.execute("""
+                CREATE TRIGGER fail_material_delete
+                BEFORE DELETE ON desktop_materials
+                BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END
+            """)
+        material_file = self.paths.media_dir / stored_name
+
+        failed = self.client.delete(
+            f"/api/v1/materials/{material_id}",
+            headers=self._authorize(),
+        )
+
+        self.assertEqual(failed.status_code, 500)
+        self.assertTrue(material_file.is_file())
+        self.assertEqual(list(self.paths.media_dir.glob("*.deleting")), [])
+        with sqlite3.connect(self.paths.database_file) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM desktop_materials WHERE id = ?",
+                    (material_id,),
+                ).fetchone()[0],
+                1,
+            )
+            connection.execute("DROP TRIGGER fail_material_delete")
+
+        deleted = self.client.delete(
+            f"/api/v1/materials/{material_id}",
+            headers=self._authorize(),
+        )
+        repeated = self.client.delete(
+            f"/api/v1/materials/{material_id}",
+            headers=self._authorize(),
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse(material_file.exists())
+        self.assertEqual(repeated.status_code, 404)
+
+    def test_material_delete_cleans_record_when_file_is_already_missing(self):
+        upload = self.client.post(
+            "/api/v1/materials",
+            data={"file": (io.BytesIO(self._mp4_bytes()), "missing.mp4")},
+            content_type="multipart/form-data",
+            headers=self._authorize(),
+        )
+        material_id = upload.get_json()["data"]["id"]
+        with sqlite3.connect(self.paths.database_file) as connection:
+            stored_name = connection.execute(
+                "SELECT stored_name FROM desktop_materials WHERE id = ?",
+                (material_id,),
+            ).fetchone()[0]
+        (self.paths.media_dir / stored_name).unlink()
+
+        deleted = self.client.delete(
+            f"/api/v1/materials/{material_id}",
+            headers=self._authorize(),
+        )
+        repeated = self.client.delete(
+            f"/api/v1/materials/{material_id}",
+            headers=self._authorize(),
+        )
+
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(repeated.status_code, 404)
 
     def test_login_rejects_unsupported_platform_without_fake_success(self):
         response = self.client.post(
