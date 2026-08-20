@@ -12,7 +12,7 @@ const isDefinitiveError = (error) => {
 export const createJobPoller = ({
   fetchJob,
   onJob,
-  onFailure,
+  onTrackingUnavailable,
   setTimer = (callback, delay) => window.setTimeout(callback, delay),
   clearTimer = (timer) => window.clearTimeout(timer),
   maxTransientFailures = 4,
@@ -33,9 +33,9 @@ export const createJobPoller = ({
     }
   }
 
-  const fail = (message) => {
+  const reportTrackingUnavailable = (message) => {
     stop()
-    onFailure(message)
+    onTrackingUnavailable(message)
   }
 
   const schedule = (job, token, delay) => {
@@ -59,12 +59,12 @@ export const createJobPoller = ({
     } catch (error) {
       if (!active || token !== generation) return
       if (isDefinitiveError(error)) {
-        fail(`任务状态请求失败（HTTP ${error.status}），已停止轮询。`)
+        reportTrackingUnavailable(`任务状态请求失败（HTTP ${error.status}），已停止轮询。`)
         return
       }
       transientFailures += 1
       if (transientFailures >= maxTransientFailures) {
-        fail(`连续 ${transientFailures} 次无法读取任务状态，已停止轮询。`)
+        reportTrackingUnavailable(`连续 ${transientFailures} 次无法读取任务状态，已停止轮询。`)
         return
       }
       const delay = Math.min(

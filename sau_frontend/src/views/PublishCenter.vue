@@ -153,6 +153,13 @@
       </div>
       <p role="status" aria-live="polite">{{ jobStatus.message }}</p>
       <el-button
+        v-if="trackingUnavailable"
+        type="warning"
+        :loading="trackingRetrying"
+        :disabled="trackingRetrying"
+        @click="retryJobTracking"
+      >重新查询任务状态</el-button>
+      <el-button
         v-if="job.status === 'waiting-for-confirmation'"
         type="warning"
         :loading="confirming"
@@ -208,7 +215,8 @@ const uploading = ref(false)
 const publishing = ref(false)
 const confirming = ref(false)
 const job = ref(null)
-const pollFailureMessage = ref('')
+const trackingUnavailable = ref('')
+const trackingRetrying = ref(false)
 
 const selectedMaterial = computed(() => (
   publishMaterials.value.find((material) => material.id === form.materialId) || null
@@ -220,20 +228,25 @@ const supportsAutomaticPublish = computed(() => (
   ['douyin', 'xiaohongshu'].includes(form.platform)
 ))
 const jobStatus = computed(() => {
+  if (trackingUnavailable.value) {
+    return {
+      label: '结果未知',
+      message: trackingUnavailable.value,
+      type: 'warning'
+    }
+  }
   const status = JOB_STATUSES[job.value?.status] || {
     label: '未知状态',
     message: '本地服务返回了无法识别的任务状态。',
     type: 'info'
   }
-  return {
-    ...status,
-    message: pollFailureMessage.value || status.message
-  }
+  return status
 })
 
 const applyJob = (nextJob) => {
   if (!nextJob || typeof nextJob.status !== 'string') return
-  pollFailureMessage.value = ''
+  trackingUnavailable.value = ''
+  trackingRetrying.value = false
   job.value = nextJob
   if (TERMINAL_STATUSES.has(nextJob.status)) {
     publishing.value = false
@@ -251,16 +264,20 @@ const jobPoller = createJobPoller({
     return response.data
   },
   onJob: applyJob,
-  onFailure: (message) => {
-    pollFailureMessage.value = message
-    job.value = { ...job.value, status: 'failed' }
-    publishing.value = false
-    ElMessage.error(message)
+  onTrackingUnavailable: (message) => {
+    trackingRetrying.value = false
+    trackingUnavailable.value = `${message} 无法确认结果，后台任务可能仍在执行，不要重复提交。`
+    ElMessage.warning(trackingUnavailable.value)
   }
 })
 
 const clearJobPoll = () => jobPoller.stop()
 const scheduleJobPoll = () => jobPoller.start(job.value)
+const retryJobTracking = () => {
+  if (!job.value?.id || trackingRetrying.value) return
+  trackingRetrying.value = true
+  scheduleJobPoll()
+}
 
 const loadMaterials = async () => {
   materialsLoading.value = true
@@ -327,7 +344,8 @@ const submitPublish = async () => {
   clearJobPoll()
   publishing.value = true
   job.value = null
-  pollFailureMessage.value = ''
+  trackingUnavailable.value = ''
+  trackingRetrying.value = false
   try {
     const response = await http.post('/api/v1/publish', publishPayload())
     applyJob(response.data)

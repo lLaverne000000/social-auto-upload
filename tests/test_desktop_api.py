@@ -219,6 +219,29 @@ class DesktopApiTests(unittest.TestCase):
         self.assertIn("error.config?.silent", request_source)
         self.assertIn("apiError", request_source)
 
+    def test_frontend_tracking_failure_is_unknown_and_keeps_publish_locked(self):
+        publish_source = Path(
+            "sau_frontend/src/views/PublishCenter.vue"
+        ).read_text(encoding="utf-8")
+        poller_source = Path(
+            "sau_frontend/src/utils/jobPolling.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("onTrackingUnavailable", poller_source)
+        self.assertNotIn("onFailure", poller_source)
+        self.assertIn("trackingUnavailable", publish_source)
+        self.assertIn("重新查询任务状态", publish_source)
+        self.assertIn(
+            "无法确认结果，后台任务可能仍在执行，不要重复提交",
+            publish_source,
+        )
+        self.assertNotIn("status: 'failed'", publish_source)
+        callback = publish_source.split("onTrackingUnavailable:", 1)[1].split(
+            "})", 1
+        )[0]
+        self.assertNotIn("status: 'failed'", callback)
+        self.assertNotIn("publishing.value = false", callback)
+
     def test_frontend_partial_uploads_and_about_copy_match_available_features(self):
         material_source = Path(
             "sau_frontend/src/views/MaterialManagement.vue"

@@ -32,13 +32,14 @@ class FakeTimers {
 
 const errorWithStatus = (status) => Object.assign(new Error(`HTTP ${status}`), { status })
 
-test('a definitive polling error fails immediately and releases the job', async () => {
+test('a definitive polling error reports tracking unavailable without a terminal job', async () => {
   const timers = new FakeTimers()
-  const failures = []
+  const unavailable = []
+  const jobs = []
   const poller = createJobPoller({
     fetchJob: async () => { throw errorWithStatus(404) },
-    onJob: () => assert.fail('404 must not produce a job update'),
-    onFailure: (message) => failures.push(message),
+    onJob: (job) => jobs.push(job),
+    onTrackingUnavailable: (message) => unavailable.push(message),
     setTimer: timers.set,
     clearTimer: timers.clear
   })
@@ -46,18 +47,20 @@ test('a definitive polling error fails immediately and releases the job', async 
   poller.start({ id: 'missing', status: 'queued' })
   await timers.runNext()
 
-  assert.equal(failures.length, 1)
-  assert.match(failures[0], /HTTP 404/)
+  assert.equal(unavailable.length, 1)
+  assert.match(unavailable[0], /HTTP 404/)
+  assert.deepEqual(jobs, [])
   assert.equal(timers.tasks.size, 0)
 })
 
-test('transient polling failures have a bounded exponential backoff', async () => {
+test('exhausted transient polling reports tracking unavailable after bounded backoff', async () => {
   const timers = new FakeTimers()
-  const failures = []
+  const unavailable = []
+  const jobs = []
   const poller = createJobPoller({
     fetchJob: async () => { throw new Error('offline') },
-    onJob: () => assert.fail('offline requests must not produce a job update'),
-    onFailure: (message) => failures.push(message),
+    onJob: (job) => jobs.push(job),
+    onTrackingUnavailable: (message) => unavailable.push(message),
     setTimer: timers.set,
     clearTimer: timers.clear,
     maxTransientFailures: 4,
@@ -71,8 +74,9 @@ test('transient polling failures have a bounded exponential backoff', async () =
   await timers.runNext()
 
   assert.deepEqual(timers.delays, [100, 100, 200, 400])
-  assert.equal(failures.length, 1)
-  assert.match(failures[0], /连续 4 次/)
+  assert.equal(unavailable.length, 1)
+  assert.match(unavailable[0], /连续 4 次/)
+  assert.deepEqual(jobs, [])
   assert.equal(timers.tasks.size, 0)
 })
 
@@ -87,7 +91,7 @@ test('a successful response resets failures and stop cancels stale work', async 
   const poller = createJobPoller({
     fetchJob: async () => responses.shift()(),
     onJob: (job) => jobs.push(job),
-    onFailure: () => assert.fail('isolated outages remain retryable'),
+    onTrackingUnavailable: () => assert.fail('isolated outages remain retryable'),
     setTimer: timers.set,
     clearTimer: timers.clear,
     maxTransientFailures: 4,
