@@ -2,17 +2,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import RESOURCE_DIR
 from utils.constant import VideoZoneTypes
 from utils.files_times import generate_schedule_time_next_day, get_title_and_hashtags
 
 if __name__ == '__main__':
-    filepath = Path(BASE_DIR) / "videos"
+    filepath = Path(RESOURCE_DIR) / "videos"
     folder_path = Path(filepath)
     files = list(folder_path.glob("*.mp4"))
     file_num = len(files)
     publish_datetimes = generate_schedule_time_next_day(file_num, 1, daily_times=[16])
-    cli_path = Path(BASE_DIR) / "sau_cli.py"
+    cli_path = Path(RESOURCE_DIR) / "sau_cli.py"
 
     for index, file in enumerate(files):
         title, tags = get_title_and_hashtags(str(file))

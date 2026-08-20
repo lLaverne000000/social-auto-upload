@@ -1,13 +1,13 @@
 import asyncio
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import BASE_DIR, RESOURCE_DIR
 from uploader.baijiahao_uploader.main import baijiahao_setup, BaiJiaHaoVideo
 from utils.files_times import generate_schedule_time_next_day, get_title_and_hashtags
 
 
 if __name__ == '__main__':
-    filepath = Path(BASE_DIR) / "videos"
+    filepath = Path(RESOURCE_DIR) / "videos"
     account_file = Path(BASE_DIR / "cookies" / "baijiahao_uploader" / "account.json")
     # 获取视频目录
     folder_path = Path(filepath)

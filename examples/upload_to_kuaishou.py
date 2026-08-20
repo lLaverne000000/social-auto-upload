@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import BASE_DIR, RESOURCE_DIR
 from uploader.ks_uploader.main import (
     KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE,
     KUAISHOU_PUBLISH_STRATEGY_SCHEDULED,
@@ -23,7 +23,7 @@ def upload_video_to_kuaishou():
     account_file = Path(BASE_DIR / "cookies" / "kuaishou_creator.json")
     account_file.parent.mkdir(exist_ok=True)
 
-    video_file_path = Path(BASE_DIR) / "videos/demo.mp4"
+    video_file_path = Path(RESOURCE_DIR) / "videos/demo.mp4"
     thumbnail_path = video_file_path.with_suffix(".png")
     video_meta_title = "快手视频上传示例"
     video_meta_hashtags = ["快手", "自动上传", "示例"]
@@ -47,9 +47,9 @@ def upload_note_to_kuaishou():
     account_file.parent.mkdir(exist_ok=True)
 
     image_paths = [
-        Path(BASE_DIR) / "videos/demo.png",
-        Path(BASE_DIR) / "videos/demo1.png",
-        Path(BASE_DIR) / "videos/demo2.png",
+        Path(RESOURCE_DIR) / "videos/demo.png",
+        Path(RESOURCE_DIR) / "videos/demo1.png",
+        Path(RESOURCE_DIR) / "videos/demo2.png",
     ]
     note = "快手图文内容示例"
     tags = ["快手图文", "自动上传", "示例"]

@@ -12,7 +12,7 @@ import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import BASE_DIR, RESOURCE_DIR
 from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_IMMEDIATE
 from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_SCHEDULED
 from uploader.tencent_uploader.main import TencentNote
@@ -23,7 +23,7 @@ ACCOUNT_FILE = Path(BASE_DIR / "cookies" / "tencent_uploader" / "account.json")
 
 
 def upload_video_to_tencent():
-    video_file = Path(BASE_DIR) / "videos" / "demo.mp4"
+    video_file = Path(RESOURCE_DIR) / "videos" / "demo.mp4"
     thumbnail_path = video_file.with_suffix(".png")
     app = TencentVideo(
         title="视频号视频示例",
@@ -42,7 +42,7 @@ def upload_video_to_tencent():
 
 
 def upload_video_to_tencent_scheduled():
-    video_file = Path(BASE_DIR) / "videos" / "demo.mp4"
+    video_file = Path(RESOURCE_DIR) / "videos" / "demo.mp4"
     thumbnail_path = video_file.with_suffix(".png")
     publish_time = (datetime.now() + timedelta(hours=3)).replace(second=0, microsecond=0)
     app = TencentVideo(
@@ -63,9 +63,9 @@ def upload_video_to_tencent_scheduled():
 
 def upload_note_to_tencent():
     image_candidates = [
-        Path(BASE_DIR) / "videos" / "demo.png",
-        Path(BASE_DIR) / "videos" / "demo1.png",
-        Path(BASE_DIR) / "videos" / "demo2.png",
+        Path(RESOURCE_DIR) / "videos" / "demo.png",
+        Path(RESOURCE_DIR) / "videos" / "demo1.png",
+        Path(RESOURCE_DIR) / "videos" / "demo2.png",
     ]
     image_paths = [str(path) for path in image_candidates if path.exists()]
     app = TencentNote(
@@ -83,9 +83,9 @@ def upload_note_to_tencent():
 
 def upload_note_to_tencent_scheduled():
     image_candidates = [
-        Path(BASE_DIR) / "videos" / "demo.png",
-        Path(BASE_DIR) / "videos" / "demo1.png",
-        Path(BASE_DIR) / "videos" / "demo2.png",
+        Path(RESOURCE_DIR) / "videos" / "demo.png",
+        Path(RESOURCE_DIR) / "videos" / "demo1.png",
+        Path(RESOURCE_DIR) / "videos" / "demo2.png",
     ]
     image_paths = [str(path) for path in image_candidates if path.exists()]
     publish_time = (datetime.now() + timedelta(hours=3)).replace(second=0, microsecond=0)

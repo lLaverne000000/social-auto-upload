@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import RESOURCE_DIR
 
 
 def _run_sau(*arguments: str) -> None:
@@ -18,7 +18,7 @@ def upload_video_to_douyin() -> None:
         "--account",
         "creator",
         "--file",
-        str(Path(BASE_DIR) / "videos" / "demo.mp4"),
+        str(Path(RESOURCE_DIR) / "videos" / "demo.mp4"),
         "--title",
         "抖音视频示例",
         "--desc",
@@ -38,8 +38,8 @@ def upload_note_to_douyin() -> None:
         "--account",
         "creator",
         "--images",
-        str(Path(BASE_DIR) / "videos" / "demo1.png"),
-        str(Path(BASE_DIR) / "videos" / "demo2.png"),
+        str(Path(RESOURCE_DIR) / "videos" / "demo1.png"),
+        str(Path(RESOURCE_DIR) / "videos" / "demo2.png"),
         "--title",
         "抖音图文示例",
         "--note",

@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import RESOURCE_DIR
 from utils.constant import VideoZoneTypes
 
 
@@ -12,7 +12,7 @@ def main() -> None:
     account = "account_a"
     # account_name is user-defined. One account_name maps to one account file.
     # You can prepare multiple account names and run them in parallel.
-    cli_path = Path(BASE_DIR) / "sau_cli.py"
+    cli_path = Path(RESOURCE_DIR) / "sau_cli.py"
     command = [
         sys.executable,
         str(cli_path),
@@ -21,7 +21,7 @@ def main() -> None:
         "--account",
         account,
         "--file",
-        str(Path(BASE_DIR) / "videos" / "demo.mp4"),
+        str(Path(RESOURCE_DIR) / "videos" / "demo.mp4"),
         "--title",
         "Bilibili CLI Demo",
         "--desc",

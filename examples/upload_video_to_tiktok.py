@@ -1,14 +1,14 @@
 import asyncio
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import BASE_DIR, RESOURCE_DIR
 # from tk_uploader.main import tiktok_setup, TiktokVideo
 from uploader.tk_uploader.main_chrome import tiktok_setup, TiktokVideo
 from utils.files_times import generate_schedule_time_next_day, get_title_and_hashtags
 
 
 if __name__ == '__main__':
-    filepath = Path(BASE_DIR) / "videos"
+    filepath = Path(RESOURCE_DIR) / "videos"
     account_file = Path(BASE_DIR / "cookies" / "tk_uploader" / "account.json")
     folder_path = Path(filepath)
     # get video files from folder
