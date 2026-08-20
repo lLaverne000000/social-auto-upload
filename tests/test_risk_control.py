@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -38,6 +39,11 @@ class _Response:
     def __init__(self, status: int, url: str = "https://creator.example.com/publish"):
         self.status = status
         self.url = url
+
+
+class _InteractiveInput(io.StringIO):
+    def isatty(self):
+        return True
 
 
 class RiskPromptTests(unittest.TestCase):
@@ -105,6 +111,64 @@ class RiskPromptTests(unittest.TestCase):
                     enabled=True,
                 )
             )
+
+    def test_manual_confirmation_without_provider_still_requires_tty(self):
+        with (
+            patch.object(risk_control.sys, "stdin", io.StringIO("")),
+            self.assertRaisesRegex(RiskControlError, "不可交互"),
+        ):
+            asyncio.run(
+                require_manual_publish_confirmation(
+                    platform="抖音",
+                    content_type="视频",
+                    headless=False,
+                    enabled=True,
+                )
+            )
+
+    def test_terminal_confirmation_keeps_publish_phrase_flow(self):
+        with (
+            patch.object(risk_control.sys, "stdin", _InteractiveInput()),
+            patch("builtins.input", return_value="PUBLISH") as input_prompt,
+        ):
+            asyncio.run(
+                require_manual_publish_confirmation(
+                    platform="抖音",
+                    content_type="视频",
+                    headless=False,
+                    enabled=True,
+                )
+            )
+
+        input_prompt.assert_called_once()
+
+    def test_context_provider_handles_confirmation_without_terminal_input(self):
+        calls = []
+
+        async def provider(*, platform, content_type):
+            calls.append((platform, content_type))
+            return True
+
+        provider_context = getattr(
+            risk_control,
+            "use_manual_confirmation_provider",
+            None,
+        )
+        self.assertIsNotNone(provider_context)
+        with (
+            provider_context(provider),
+            patch.object(risk_control.sys, "stdin", io.StringIO("")),
+        ):
+            asyncio.run(
+                require_manual_publish_confirmation(
+                    platform="小红书",
+                    content_type="视频",
+                    headless=False,
+                    enabled=True,
+                )
+            )
+
+        self.assertEqual(calls, [("小红书", "视频")])
 
     def test_compatibility_hook_does_not_inject_javascript(self):
         context = AsyncMock()

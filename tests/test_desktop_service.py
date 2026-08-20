@@ -1,8 +1,11 @@
 import asyncio
+import io
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sau_desktop_service import (
     JobManager,
@@ -11,6 +14,7 @@ from sau_desktop_service import (
     build_publish_argv,
 )
 from utils.risk_control import RiskControlError
+from utils.risk_control import require_manual_publish_confirmation
 
 
 class DesktopServiceTranslationTests(unittest.TestCase):
@@ -48,6 +52,20 @@ class DesktopServiceTranslationTests(unittest.TestCase):
             argv = build_publish_argv(request)
 
         self.assertIn("--automatic-publish", argv)
+
+    def test_automatic_publish_rejects_non_boolean_values(self):
+        for invalid in ("false", 1):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                request = PublishRequest(
+                    platform="xiaohongshu",
+                    account_name="creator",
+                    media_file=self._media_file(tmp),
+                    title="标题",
+                    content_source="original",
+                    automatic_publish=invalid,
+                )
+                with self.assertRaisesRegex(ValueError, "automatic_publish"):
+                    build_publish_argv(request)
 
     def test_douyin_requires_explicit_declaration_value(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -110,6 +128,93 @@ class DesktopServiceJobTests(unittest.TestCase):
 
         self.assertEqual(result.status, JobStatus.SUCCEEDED)
         self.assertEqual(seen, [("kuaishou", "upload-video", "creator", False)])
+
+    def test_windowed_job_waits_for_explicit_confirmation_without_tty(self):
+        async def dispatcher(args):
+            await require_manual_publish_confirmation(
+                platform="小红书",
+                content_type="视频",
+                headless=args.headless,
+                enabled=args.confirm_before_publish,
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "demo.mp4"
+            media.write_bytes(b"video")
+            request = PublishRequest(
+                platform="xiaohongshu",
+                account_name="creator",
+                media_file=media,
+                title="标题",
+                content_source="original",
+            )
+            manager = JobManager(dispatcher=dispatcher)
+            self.addCleanup(manager.shutdown)
+            with patch("sys.stdin", io.StringIO("")):
+                job = manager.submit(request)
+                waiting = self._wait_for_status(
+                    manager,
+                    job.id,
+                    JobStatus.WAITING_FOR_CONFIRMATION,
+                )
+                self.assertIn("小红书", waiting.message)
+                manager.confirm(job.id)
+                result = manager.wait(job.id, timeout=2)
+
+        self.assertEqual(result.status, JobStatus.SUCCEEDED)
+
+    def test_shutdown_releases_job_waiting_for_confirmation(self):
+        async def dispatcher(args):
+            await require_manual_publish_confirmation(
+                platform="小红书",
+                content_type="视频",
+                headless=args.headless,
+                enabled=args.confirm_before_publish,
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "demo.mp4"
+            media.write_bytes(b"video")
+            manager = JobManager(dispatcher=dispatcher)
+            job = manager.submit(PublishRequest(
+                platform="xiaohongshu",
+                account_name="creator",
+                media_file=media,
+                title="标题",
+                content_source="original",
+            ))
+            self._wait_for_status(
+                manager,
+                job.id,
+                JobStatus.WAITING_FOR_CONFIRMATION,
+            )
+            manager.shutdown()
+            result = manager.get(job.id)
+
+        self.assertEqual(result.status, JobStatus.BLOCKED)
+        self.assertIn("stopped", result.message.lower())
+
+    def test_returned_job_is_an_immutable_detached_snapshot(self):
+        release = threading.Event()
+
+        async def dispatcher(_args):
+            await asyncio.to_thread(release.wait, 2)
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = JobManager(dispatcher=dispatcher)
+            self.addCleanup(manager.shutdown)
+            snapshot = manager.submit(self._request(tmp))
+            object.__setattr__(snapshot, "status", JobStatus.SUCCEEDED)
+            internal = manager.get(snapshot.id)
+            release.set()
+            result = manager.wait(snapshot.id, timeout=2)
+
+        self.assertIsNot(internal, snapshot)
+        self.assertNotEqual(internal.status, JobStatus.SUCCEEDED)
+        self.assertEqual(result.status, JobStatus.SUCCEEDED)
 
     def test_risk_control_error_is_blocked(self):
         async def dispatcher(_args):
@@ -201,6 +306,21 @@ class DesktopServiceJobTests(unittest.TestCase):
             with self.assertRaises(KeyError):
                 manager.get(jobs[0].id)
             self.assertEqual(manager.get(jobs[-1].id).status, JobStatus.SUCCEEDED)
+
+    def _wait_for_status(
+        self,
+        manager: JobManager,
+        job_id: str,
+        expected: JobStatus,
+        timeout: float = 2,
+    ):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            job = manager.get(job_id)
+            if job.status == expected:
+                return job
+            time.sleep(0.01)
+        self.fail(f"job {job_id} did not reach {expected.value}")
 
 
 if __name__ == "__main__":

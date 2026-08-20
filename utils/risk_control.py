@@ -8,8 +8,10 @@ import re
 import sys
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Iterable
+from typing import Awaitable, Callable, Iterable, Iterator
 from urllib.parse import parse_qs, urlparse
 
 try:
@@ -25,6 +27,23 @@ except ImportError:  # pragma: no cover - POSIX
 
 class RiskControlError(RuntimeError):
     """Raised when a publish attempt should stop instead of retrying."""
+
+
+ManualConfirmationProvider = Callable[..., Awaitable[bool]]
+_MANUAL_CONFIRMATION_PROVIDER: ContextVar[ManualConfirmationProvider | None] = (
+    ContextVar("sau_manual_confirmation_provider", default=None)
+)
+
+
+@contextmanager
+def use_manual_confirmation_provider(
+    provider: ManualConfirmationProvider,
+) -> Iterator[None]:
+    token = _MANUAL_CONFIRMATION_PROVIDER.set(provider)
+    try:
+        yield
+    finally:
+        _MANUAL_CONFIRMATION_PROVIDER.reset(token)
 
 
 class _CliPublishPermit:
@@ -308,6 +327,22 @@ async def require_manual_publish_confirmation(
         return
     if headless:
         raise RiskControlError(f"{platform}: 人工确认发布要求使用 --headed")
+
+    provider = _MANUAL_CONFIRMATION_PROVIDER.get()
+    if provider is not None:
+        try:
+            confirmed = await provider(
+                platform=platform,
+                content_type=content_type,
+            )
+        except RiskControlError:
+            raise
+        except Exception as exc:
+            raise RiskControlError(f"{platform}: GUI 人工确认失败，已停止发布") from exc
+        if not confirmed:
+            raise RiskControlError(f"{platform}: GUI 人工确认已停止，拒绝发布")
+        return
+
     if not sys.stdin or not sys.stdin.isatty():
         raise RiskControlError(f"{platform}: 当前终端不可交互，拒绝跳过人工发布确认")
 

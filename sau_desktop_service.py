@@ -8,13 +8,13 @@ import uuid
 from argparse import ArgumentParser, Namespace
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
 
 from sau_cli import build_parser, dispatch
-from utils.risk_control import RiskControlError
+from utils.risk_control import RiskControlError, use_manual_confirmation_provider
 
 
 class JobStatus(str, Enum):
@@ -41,7 +41,7 @@ class PublishRequest:
     automatic_publish: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class PublishJob:
     id: str
     request: PublishRequest
@@ -50,6 +50,12 @@ class PublishJob:
     result_code: int | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfirmationWaiter:
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[bool]
 
 
 def _validated_media_file(media_file: Path) -> Path:
@@ -80,6 +86,8 @@ def build_publish_argv(request: PublishRequest) -> list[str]:
         raise ValueError("account_name is required")
     if not request.title.strip():
         raise ValueError("title is required")
+    if type(request.automatic_publish) is not bool:
+        raise ValueError("automatic_publish must be a boolean")
 
     media_file = _validated_media_file(request.media_file)
     tags = _normalized_tags(request.tags)
@@ -116,7 +124,7 @@ def build_publish_argv(request: PublishRequest) -> list[str]:
             raise ValueError("content_source must be 'original' or 'repost'")
         argv.extend(("--content-source", content_source))
 
-    if request.automatic_publish and request.platform in {"douyin", "xiaohongshu"}:
+    if request.automatic_publish is True and request.platform in {"douyin", "xiaohongshu"}:
         argv.append("--automatic-publish")
     return argv
 
@@ -141,19 +149,23 @@ class JobManager:
         self._jobs: dict[str, PublishJob] = {}
         self._futures: dict[str, Future[None]] = {}
         self._completed: deque[str] = deque()
+        self._confirmations: dict[str, _ConfirmationWaiter] = {}
+        self._shutting_down = False
 
     def submit(self, request: PublishRequest) -> PublishJob:
         argv = build_publish_argv(request)
         job = PublishJob(id=uuid.uuid4().hex, request=request)
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("job manager is shutting down")
             self._jobs[job.id] = job
             self._futures[job.id] = self._executor.submit(self._run, job.id, argv)
-        return job
+            return replace(job)
 
     def get(self, job_id: str) -> PublishJob:
         with self._lock:
             try:
-                return self._jobs[job_id]
+                return replace(self._jobs[job_id])
             except KeyError as exc:
                 raise KeyError(f"unknown job: {job_id}") from exc
 
@@ -165,16 +177,49 @@ class JobManager:
         future.result(timeout=timeout)
         return self.get(job_id)
 
+    def confirm(self, job_id: str) -> PublishJob:
+        with self._lock:
+            try:
+                job = self._jobs[job_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown job: {job_id}") from exc
+            waiter = self._confirmations.pop(job_id, None)
+            if job.status is not JobStatus.WAITING_FOR_CONFIRMATION or waiter is None:
+                raise ValueError(f"job is not waiting for confirmation: {job_id}")
+            self._jobs[job_id] = replace(
+                job,
+                status=JobStatus.RUNNING,
+                message="",
+                updated_at=time.time(),
+            )
+            snapshot = replace(self._jobs[job_id])
+        self._resolve_confirmation(waiter, True)
+        return snapshot
+
     def shutdown(self) -> None:
+        with self._lock:
+            self._shutting_down = True
+            waiters = tuple(self._confirmations.values())
+            self._confirmations.clear()
+        for waiter in waiters:
+            self._resolve_confirmation(waiter, False)
         self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _run(self, job_id: str, argv: list[str]) -> None:
         self._set_job(job_id, status=JobStatus.RUNNING, message="")
         try:
             args = self._parser_factory().parse_args(argv)
-            result = self._dispatcher(args)
-            if inspect.isawaitable(result):
-                result = asyncio.run(result)
+            async def confirmation_provider(*, platform: str, content_type: str) -> bool:
+                return await self._await_confirmation(
+                    job_id,
+                    platform=platform,
+                    content_type=content_type,
+                )
+
+            with use_manual_confirmation_provider(confirmation_provider):
+                result = self._dispatcher(args)
+                if inspect.isawaitable(result):
+                    result = asyncio.run(result)
             if type(result) is int and result == 0:
                 self._set_job(
                     job_id,
@@ -213,10 +258,54 @@ class JobManager:
     ) -> None:
         with self._lock:
             job = self._jobs[job_id]
-            job.status = status
-            job.message = message
-            job.result_code = result_code
-            job.updated_at = time.time()
+            self._jobs[job_id] = replace(
+                job,
+                status=status,
+                message=message,
+                result_code=result_code,
+                updated_at=time.time(),
+            )
+
+    async def _await_confirmation(
+        self,
+        job_id: str,
+        *,
+        platform: str,
+        content_type: str,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        waiter = _ConfirmationWaiter(loop=loop, future=future)
+        with self._lock:
+            if self._shutting_down:
+                raise RiskControlError("desktop confirmation stopped during shutdown")
+            job = self._jobs[job_id]
+            self._confirmations[job_id] = waiter
+            self._jobs[job_id] = replace(
+                job,
+                status=JobStatus.WAITING_FOR_CONFIRMATION,
+                message=f"{platform}{content_type}等待人工确认",
+                updated_at=time.time(),
+            )
+        try:
+            confirmed = await future
+        finally:
+            with self._lock:
+                current = self._confirmations.get(job_id)
+                if current is waiter:
+                    self._confirmations.pop(job_id, None)
+        if not confirmed:
+            raise RiskControlError("desktop confirmation stopped during shutdown")
+        self._set_job(job_id, status=JobStatus.RUNNING, message="")
+        return True
+
+    @staticmethod
+    def _resolve_confirmation(waiter: _ConfirmationWaiter, decision: bool) -> None:
+        def resolve() -> None:
+            if not waiter.future.done():
+                waiter.future.set_result(decision)
+
+        waiter.loop.call_soon_threadsafe(resolve)
 
     def _retain_completed(self, job_id: str) -> None:
         with self._lock:
