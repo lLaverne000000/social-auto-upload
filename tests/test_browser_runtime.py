@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,14 @@ import sau_browser_runtime
 
 
 class BrowserRuntimeTests(unittest.TestCase):
+    def test_packaging_metadata_uses_sau_cli_and_not_stale_cli_main(self):
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        modules = metadata["tool"]["setuptools"]["py-modules"]
+
+        self.assertIn("sau_cli", modules)
+        self.assertNotIn("cli_main", modules)
+
     def make_paths(self, root: Path) -> RuntimePaths:
         return RuntimePaths(
             root, root / "data", root / "data/cookies", root / "data/profiles",
