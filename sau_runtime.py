@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import platform
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +20,35 @@ class RuntimePaths:
     safety_dir: Path
     media_dir: Path
     database_file: Path
+
+
+_RUNTIME_PATHS_OVERRIDE: ContextVar[RuntimePaths | None] = ContextVar(
+    "sau_runtime_paths_override",
+    default=None,
+)
+
+
+def _create_runtime_directories(paths: RuntimePaths) -> None:
+    for directory in (
+        paths.data_root,
+        paths.cookies_dir,
+        paths.profiles_dir,
+        paths.logs_dir,
+        paths.safety_dir,
+        paths.media_dir,
+        paths.database_file.parent,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def use_runtime_paths(paths: RuntimePaths) -> Iterator[RuntimePaths]:
+    """Scope runtime paths to the current thread/async context."""
+    token = _RUNTIME_PATHS_OVERRIDE.set(paths)
+    try:
+        yield paths
+    finally:
+        _RUNTIME_PATHS_OVERRIDE.reset(token)
 
 
 def resolve_resource_root() -> Path:
@@ -41,6 +73,12 @@ def resolve_data_root() -> Path:
 
 
 def get_runtime_paths(*, create: bool = True) -> RuntimePaths:
+    scoped = _RUNTIME_PATHS_OVERRIDE.get()
+    if scoped is not None:
+        if create:
+            _create_runtime_directories(scoped)
+        return scoped
+
     data_root = resolve_data_root()
     paths = RuntimePaths(
         resource_root=resolve_resource_root(),
@@ -53,14 +91,5 @@ def get_runtime_paths(*, create: bool = True) -> RuntimePaths:
         database_file=data_root / "db" / "database.db",
     )
     if create:
-        for directory in (
-            paths.data_root,
-            paths.cookies_dir,
-            paths.profiles_dir,
-            paths.logs_dir,
-            paths.safety_dir,
-            paths.media_dir,
-            paths.database_file.parent,
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
+        _create_runtime_directories(paths)
     return paths

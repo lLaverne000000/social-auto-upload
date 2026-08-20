@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -36,3 +37,46 @@ class RuntimePathTests(unittest.TestCase):
                 paths = sau_runtime.get_runtime_paths(create=False)
             self.assertEqual(paths.data_root, root.resolve())
             self.assertFalse(root.exists())
+
+    def test_scoped_runtime_paths_are_context_local_and_restore_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = sau_runtime.RuntimePaths(
+                root / "resources",
+                root / "first",
+                root / "first/cookies",
+                root / "first/profiles",
+                root / "first/logs",
+                root / "first/.sau_safety",
+                root / "first/media",
+                root / "first/db/database.db",
+            )
+            second = sau_runtime.RuntimePaths(
+                root / "resources",
+                root / "second",
+                root / "second/cookies",
+                root / "second/profiles",
+                root / "second/logs",
+                root / "second/.sau_safety",
+                root / "second/media",
+                root / "second/db/database.db",
+            )
+            barrier = threading.Barrier(2)
+            seen = []
+
+            def resolve(scoped):
+                with sau_runtime.use_runtime_paths(scoped):
+                    barrier.wait(timeout=2)
+                    seen.append(sau_runtime.get_runtime_paths(create=False))
+
+            threads = [
+                threading.Thread(target=resolve, args=(first,)),
+                threading.Thread(target=resolve, args=(second,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+            self.assertCountEqual(seen, [first, second])
+            self.assertNotIn(sau_runtime.get_runtime_paths(create=False), (first, second))

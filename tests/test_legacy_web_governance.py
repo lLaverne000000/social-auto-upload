@@ -9,6 +9,7 @@ except ModuleNotFoundError:
 @unittest.skipIf(app is None, "web optional dependencies are not installed")
 class LegacyWebGovernanceTests(unittest.TestCase):
     def setUp(self):
+        app.config["SERVER_NAME"] = "127.0.0.1"
         self.client = app.test_client()
         self.payload = {
             "fileList": ["demo.mp4"],
