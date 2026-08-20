@@ -3,13 +3,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from sau_browser_runtime import configure_browser_environment
 from sau_runtime import get_runtime_paths
+
+_BROWSER_PAYLOAD = configure_browser_environment(
+    get_runtime_paths(),
+    required=bool(getattr(sys, "frozen", False)),
+)
+
+# Uploader modules retain their existing launch helpers, which read this setting
+# from ``conf`` at import time. The staged executable therefore wins before any
+# uploader (or Patchright) import can select a browser.
+if _BROWSER_PAYLOAD is not None:
+    import conf
+
+    conf.LOCAL_CHROME_PATH = os.environ["SAU_CHROMIUM_EXECUTABLE"]
+
 from uploader.baijiahao_uploader.main import (
     BaiJiaHaoVideo,
     baijiahao_setup,
