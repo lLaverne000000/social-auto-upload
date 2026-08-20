@@ -9,6 +9,14 @@ const request = axios.create({
   }
 })
 
+const createApiError = ({ message, status, code, envelope, cause }) => {
+  const apiError = new Error(message, cause ? { cause } : undefined)
+  apiError.status = status
+  apiError.code = code
+  apiError.envelope = envelope
+  return apiError
+}
+
 request.interceptors.response.use(
   (response) => {
     const envelope = response.data
@@ -17,20 +25,32 @@ request.interceptors.response.use(
     }
 
     const message = envelope?.error?.message || '请求失败'
-    ElMessage.error(message)
-    return Promise.reject(new Error(message))
+    if (response.config?.silent !== true) ElMessage.error(message)
+    return Promise.reject(createApiError({
+      message,
+      status: response.status,
+      code: envelope?.error?.code,
+      envelope
+    }))
   },
   (error) => {
-    const message = error.response?.data?.error?.message
+    const envelope = error.response?.data
+    const message = envelope?.error?.message
       || (error.response ? `请求失败（HTTP ${error.response.status}）` : '无法连接本地服务')
-    ElMessage.error(message)
-    return Promise.reject(new Error(message, { cause: error }))
+    if (error.config?.silent !== true) ElMessage.error(message)
+    return Promise.reject(createApiError({
+      message,
+      status: error.response?.status,
+      code: envelope?.error?.code || error.code,
+      envelope,
+      cause: error
+    }))
   }
 )
 
 export const http = {
-  get(url, params) {
-    return request.get(url, { params })
+  get(url, params, config = {}) {
+    return request.get(url, { ...config, params })
   },
 
   post(url, data, config = {}) {
@@ -41,8 +61,8 @@ export const http = {
     return request.delete(url, config)
   },
 
-  upload(url, formData, onUploadProgress) {
-    return request.post(url, formData, { onUploadProgress })
+  upload(url, formData, onUploadProgress, config = {}) {
+    return request.post(url, formData, { ...config, onUploadProgress })
   }
 }
 

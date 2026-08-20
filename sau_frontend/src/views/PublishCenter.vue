@@ -167,6 +167,8 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { materialApi } from '@/api/material'
+import { formatBytes } from '@/utils/format'
+import { createJobPoller } from '@/utils/jobPolling'
 import { http } from '@/utils/request'
 
 const platforms = [
@@ -206,8 +208,7 @@ const uploading = ref(false)
 const publishing = ref(false)
 const confirming = ref(false)
 const job = ref(null)
-let pollTimer = null
-let disposed = false
+const pollFailureMessage = ref('')
 
 const selectedMaterial = computed(() => (
   publishMaterials.value.find((material) => material.id === form.materialId) || null
@@ -218,23 +219,21 @@ const publishMaterials = computed(() => (
 const supportsAutomaticPublish = computed(() => (
   ['douyin', 'xiaohongshu'].includes(form.platform)
 ))
-const jobStatus = computed(() => (
-  JOB_STATUSES[job.value?.status] || {
+const jobStatus = computed(() => {
+  const status = JOB_STATUSES[job.value?.status] || {
     label: '未知状态',
     message: '本地服务返回了无法识别的任务状态。',
     type: 'info'
   }
-))
-
-const clearJobPoll = () => {
-  if (pollTimer !== null) {
-    window.clearTimeout(pollTimer)
-    pollTimer = null
+  return {
+    ...status,
+    message: pollFailureMessage.value || status.message
   }
-}
+})
 
 const applyJob = (nextJob) => {
   if (!nextJob || typeof nextJob.status !== 'string') return
+  pollFailureMessage.value = ''
   job.value = nextJob
   if (TERMINAL_STATUSES.has(nextJob.status)) {
     publishing.value = false
@@ -242,26 +241,26 @@ const applyJob = (nextJob) => {
   }
 }
 
-const scheduleJobPoll = () => {
-  clearJobPoll()
-  if (disposed) return
-  pollTimer = window.setTimeout(() => pollJob(job.value), 1000)
-}
-
-const pollJob = async (job) => {
-  if (!job?.id || TERMINAL_STATUSES.has(job.status)) return
-  try {
-    const response = await http.get(`/api/v1/jobs/${job.id}`)
-    applyJob(response.data)
-  } catch {
-    // The request helper already reports the connection error. Keep the
-    // submitted job active and retry instead of inventing a terminal state.
-  } finally {
-    if (publishing.value && !TERMINAL_STATUSES.has(job.status)) {
-      scheduleJobPoll()
-    }
+const jobPoller = createJobPoller({
+  fetchJob: async (job) => {
+    const response = await http.get(
+      `/api/v1/jobs/${job.id}`,
+      undefined,
+      { silent: true }
+    )
+    return response.data
+  },
+  onJob: applyJob,
+  onFailure: (message) => {
+    pollFailureMessage.value = message
+    job.value = { ...job.value, status: 'failed' }
+    publishing.value = false
+    ElMessage.error(message)
   }
-}
+})
+
+const clearJobPoll = () => jobPoller.stop()
+const scheduleJobPoll = () => jobPoller.start(job.value)
 
 const loadMaterials = async () => {
   materialsLoading.value = true
@@ -328,6 +327,7 @@ const submitPublish = async () => {
   clearJobPoll()
   publishing.value = true
   job.value = null
+  pollFailureMessage.value = ''
   try {
     const response = await http.post('/api/v1/publish', publishPayload())
     applyJob(response.data)
@@ -363,9 +363,6 @@ watch(
 )
 
 onMounted(loadMaterials)
-onBeforeUnmount(() => {
-  disposed = true
-})
 onBeforeUnmount(clearJobPoll)
 </script>
 

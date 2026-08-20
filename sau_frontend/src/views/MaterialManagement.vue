@@ -85,6 +85,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { materialApi } from '@/api/material'
+import { formatBytes } from '@/utils/format'
 
 const materials = ref([])
 const searchKeyword = ref('')
@@ -114,21 +115,38 @@ const fetchMaterials = async () => {
 const submitUpload = async () => {
   if (!uploadFiles.value.length || uploading.value) return
   uploading.value = true
+  const selectedUploads = uploadFiles.value.filter((upload) => upload.raw)
   let uploadedCount = 0
+  let failedUploads = []
   try {
-    for (const upload of uploadFiles.value) {
-      if (!upload.raw) continue
+    const results = await Promise.allSettled(selectedUploads.map(async (upload) => {
       const formData = new FormData()
       formData.append('file', upload.raw)
-      await materialApi.uploadMaterial(formData)
-      uploadedCount += 1
-    }
-    uploadFiles.value = []
-    uploadDialogVisible.value = false
-    await fetchMaterials()
-    ElMessage.success(`已上传 ${uploadedCount} 个素材`)
+      await materialApi.uploadMaterial(formData, undefined, { silent: true })
+      return upload
+    }))
+    failedUploads = selectedUploads.filter((_, index) => results[index].status === 'rejected')
+    uploadedCount = results.length - failedUploads.length
+    uploadFiles.value = failedUploads
   } finally {
-    uploading.value = false
+    try {
+      if (uploadedCount > 0) await fetchMaterials()
+    } catch {
+      // fetchMaterials reports its own request error. Keep the per-file upload
+      // result available so failed files can still be retried without duplicates.
+    } finally {
+      uploading.value = false
+    }
+  }
+
+  if (uploadedCount > 0) {
+    ElMessage.success(`已上传 ${uploadedCount} 个素材`)
+  }
+  if (failedUploads.length > 0) {
+    const names = failedUploads.map((upload) => upload.name).join('、')
+    ElMessage.error(`以下素材上传失败，已保留以便重试：${names}`)
+  } else {
+    uploadDialogVisible.value = false
   }
 }
 
@@ -159,12 +177,6 @@ const deleteMaterial = async (material) => {
   await materialApi.deleteMaterial(material.id)
   materials.value = materials.value.filter((item) => item.id !== material.id)
   ElMessage.success('素材已删除')
-}
-
-const formatBytes = (size) => {
-  if (!Number.isFinite(size)) return '—'
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
-  return `${(size / 1024 / 1024).toFixed(2)} MB`
 }
 
 const formatDate = (timestamp) => (

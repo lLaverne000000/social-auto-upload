@@ -205,6 +205,41 @@ class DesktopApiTests(unittest.TestCase):
         )
         self.assertIn('role="alert"', app_source)
 
+    def test_frontend_runtime_helpers_and_polling_requests_are_explicit(self):
+        publish_source = Path(
+            "sau_frontend/src/views/PublishCenter.vue"
+        ).read_text(encoding="utf-8")
+        request_source = Path(
+            "sau_frontend/src/utils/request.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("import { formatBytes }", publish_source)
+        self.assertIn("createJobPoller", publish_source)
+        self.assertIn("silent: true", publish_source)
+        self.assertIn("error.config?.silent", request_source)
+        self.assertIn("apiError", request_source)
+
+    def test_frontend_partial_uploads_and_about_copy_match_available_features(self):
+        material_source = Path(
+            "sau_frontend/src/views/MaterialManagement.vue"
+        ).read_text(encoding="utf-8")
+        about_source = Path("sau_frontend/src/views/About.vue").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Promise.allSettled", material_source)
+        self.assertIn("uploadFiles.value = failedUploads", material_source)
+        self.assertIn("await fetchMaterials()", material_source)
+        for retired_claim in ("一键多平台发布", "批量发布", "Cookie 导入导出"):
+            self.assertNotIn(retired_claim, about_source)
+        for available_feature in (
+            "GUI 与 CLI",
+            "本机素材库",
+            "人工确认",
+            "离线运行",
+        ):
+            self.assertIn(available_feature, about_source)
+
     def test_index_sets_strict_http_only_session_cookie(self):
         response = self.client.get("/")
 

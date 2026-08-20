@@ -9,8 +9,8 @@ export const materialApi = {
     return http.get('/api/v1/materials')
   },
 
-  uploadMaterial(formData, onUploadProgress) {
-    return http.upload('/api/v1/materials', formData, onUploadProgress)
+  uploadMaterial(formData, onUploadProgress, config = {}) {
+    return http.upload('/api/v1/materials', formData, onUploadProgress, config)
   },
 
   deleteMaterial(id) {
