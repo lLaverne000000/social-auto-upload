@@ -1,6 +1,8 @@
-from pathlib import Path
+from sau_runtime import get_runtime_paths
 
-BASE_DIR = Path(__file__).parent.resolve()
+_RUNTIME_PATHS = get_runtime_paths()
+BASE_DIR = _RUNTIME_PATHS.data_root
+RESOURCE_DIR = _RUNTIME_PATHS.resource_root
 XHS_SERVER = "http://127.0.0.1:11901"  # only used by xhs-related flows
 LOCAL_CHROME_PATH = ""  # optional, e.g. C:/Program Files/Google/Chrome/Application/chrome.exe
 LOCAL_CHROME_HEADLESS = True  # default headless behavior for uploader/examples

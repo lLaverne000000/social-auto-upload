@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from conf import BASE_DIR
+from sau_runtime import get_runtime_paths
 from uploader.baijiahao_uploader.main import (
     BaiJiaHaoVideo,
     baijiahao_setup,
@@ -278,7 +278,7 @@ def has_interactive_terminal() -> bool:
 
 
 def resolve_runtime_home() -> Path:
-    return Path(BASE_DIR)
+    return get_runtime_paths().data_root
 
 
 def resolve_account_file(platform: str, account_name: str) -> Path:
