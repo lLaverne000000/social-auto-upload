@@ -1,8 +1,8 @@
 import hashlib
 import json
 import os
+import re
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,10 +12,20 @@ import sau_browser_runtime
 
 
 class BrowserRuntimeTests(unittest.TestCase):
+    def test_packaging_metadata_assertion_is_python_310_compatible(self):
+        test_source = Path(__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("import " + "toml" + "lib", test_source)
+
     def test_packaging_metadata_uses_sau_cli_and_not_stale_cli_main(self):
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-        metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        modules = metadata["tool"]["setuptools"]["py-modules"]
+        match = re.search(
+            r"^py-modules\s*=\s*\[([^]]*)\]",
+            pyproject.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        self.assertIsNotNone(match)
+        modules = re.findall(r'"([^"]+)"', match.group(1))
 
         self.assertIn("sau_cli", modules)
         self.assertNotIn("cli_main", modules)
