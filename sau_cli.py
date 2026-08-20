@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -66,6 +67,10 @@ from uploader.youtube_uploader.main import (
     cookie_auth as youtube_cookie_auth,
     youtube_setup,
 )
+from utils.risk_control import PublishGuard
+from utils.risk_control import content_fingerprint
+from utils.risk_control import _issue_cli_publish_permit
+from utils.risk_control import read_publish_safety_status
 
 SCHEDULE_FORMAT = "%Y-%m-%d %H:%M"
 
@@ -88,6 +93,8 @@ class DouyinVideoUploadRequest:
     headless: bool = True
     declaration: str | None = None
     collection_name: str | None = None
+    confirm_before_publish: bool = True
+    min_publish_interval_minutes: int = 30
 
 
 @dataclass(slots=True)
@@ -102,6 +109,8 @@ class DouyinNoteUploadRequest:
     debug: bool = True
     headless: bool = True
     bgm: str = ""
+    confirm_before_publish: bool = True
+    min_publish_interval_minutes: int = 30
 
 
 @dataclass(slots=True)
@@ -144,6 +153,10 @@ class XiaohongshuVideoUploadRequest:
     publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    confirm_before_publish: bool = True
+    min_publish_interval_minutes: int = 30
+    content_source: str | None = None
+    repost_source: str = ""
 
 
 @dataclass(slots=True)
@@ -157,6 +170,10 @@ class XiaohongshuNoteUploadRequest:
     publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    confirm_before_publish: bool = True
+    min_publish_interval_minutes: int = 30
+    content_source: str | None = None
+    repost_source: str = ""
 
 
 @dataclass(slots=True)
@@ -407,59 +424,105 @@ async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> Path:
 
 
 async def upload_video(request: DouyinVideoUploadRequest) -> Path:
+    if request.confirm_before_publish and request.headless:
+        raise RuntimeError("Douyin: manual publish confirmation requires headed mode")
     account_file = resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False)
-    if not is_ready:
-        raise RuntimeError(
-            f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
-        )
-
-    app = DouYinVideo(
+    fingerprint = content_fingerprint(
         request.title,
-        str(request.video_file),
-        request.tags,
-        request.publish_date,
-        str(account_file),
-        desc=request.description,
-        thumbnail_landscape_path=(
-            str(request.thumbnail_landscape_file) if request.thumbnail_landscape_file else None
-        ),
-        thumbnail_portrait_path=str(
-            request.thumbnail_portrait_file or request.thumbnail_file
-        ) if request.thumbnail_portrait_file or request.thumbnail_file else None,
-        productLink=request.product_link,
-        productTitle=request.product_title,
-        declaration=request.declaration,
-        publish_strategy=request.publish_strategy,
-        debug=request.debug,
-        headless=request.headless,
-        collection_name=request.collection_name,
+        "\n".join((request.description, " ".join(request.tags))),
+        [request.video_file],
     )
-    await app.douyin_upload_video()
+    with PublishGuard(
+        platform="douyin",
+        account_file=account_file,
+        fingerprint=fingerprint,
+        min_interval_minutes=request.min_publish_interval_minutes,
+        operation="upload-video",
+    ) as guard:
+        app = DouYinVideo(
+            request.title,
+            str(request.video_file),
+            request.tags,
+            request.publish_date,
+            str(account_file),
+            desc=request.description,
+            thumbnail_landscape_path=(
+                str(request.thumbnail_landscape_file) if request.thumbnail_landscape_file else None
+            ),
+            thumbnail_portrait_path=str(
+                request.thumbnail_portrait_file or request.thumbnail_file
+            ) if request.thumbnail_portrait_file or request.thumbnail_file else None,
+            productLink=request.product_link,
+            productTitle=request.product_title,
+            declaration=request.declaration,
+            publish_strategy=request.publish_strategy,
+            debug=request.debug,
+            headless=request.headless,
+            collection_name=request.collection_name,
+            confirm_before_publish=request.confirm_before_publish,
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        try:
+            await app.douyin_upload_video()
+        except Exception:
+            guard.set_failure_context(
+                stage="upload-video",
+                page_url=getattr(app, "publish_current_url", ""),
+            )
+            raise
+        finally:
+            if app.publish_succeeded:
+                guard.mark_success(
+                    success_url=app.publish_success_url,
+                    work_id=app.publish_work_id,
+                )
     return account_file
 
 
 async def upload_note(request: DouyinNoteUploadRequest) -> Path:
+    if request.confirm_before_publish and request.headless:
+        raise RuntimeError("Douyin: manual publish confirmation requires headed mode")
     account_file = resolve_account_file("douyin", request.account_name)
-    is_ready = await douyin_setup(str(account_file), handle=False)
-    if not is_ready:
-        raise RuntimeError(
-            f"Douyin cookie is missing or expired: {account_file}. Run `sau douyin login --account {request.account_name}` first."
-        )
-
-    app = DouYinNote(
-        image_paths=[str(path) for path in request.image_files],
-        title=request.title,
-        note=request.note,
-        tags=request.tags,
-        publish_date=request.publish_date,
-        account_file=str(account_file),
-        publish_strategy=request.publish_strategy,
-        debug=request.debug,
-        headless=request.headless,
-        bgm=request.bgm,
+    fingerprint = content_fingerprint(
+        request.title,
+        "\n".join((request.note, " ".join(request.tags))),
+        request.image_files,
     )
-    await app.douyin_upload_note()
+    with PublishGuard(
+        platform="douyin",
+        account_file=account_file,
+        fingerprint=fingerprint,
+        min_interval_minutes=request.min_publish_interval_minutes,
+        operation="upload-note",
+    ) as guard:
+        app = DouYinNote(
+            image_paths=[str(path) for path in request.image_files],
+            title=request.title,
+            note=request.note,
+            tags=request.tags,
+            publish_date=request.publish_date,
+            account_file=str(account_file),
+            publish_strategy=request.publish_strategy,
+            debug=request.debug,
+            headless=request.headless,
+            bgm=request.bgm,
+            confirm_before_publish=request.confirm_before_publish,
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        try:
+            await app.douyin_upload_note()
+        except Exception:
+            guard.set_failure_context(
+                stage="upload-note",
+                page_url=getattr(app, "publish_current_url", ""),
+            )
+            raise
+        finally:
+            if app.publish_succeeded:
+                guard.mark_success(
+                    success_url=app.publish_success_url,
+                    work_id=app.publish_work_id,
+                )
     return account_file
 
 
@@ -512,50 +575,100 @@ async def upload_kuaishou_note(request: KuaishouNoteUploadRequest) -> Path:
 
 
 async def upload_xiaohongshu_video(request: XiaohongshuVideoUploadRequest) -> Path:
+    if request.confirm_before_publish and request.headless:
+        raise RuntimeError("Xiaohongshu: manual publish confirmation requires headed mode")
     account_file = resolve_account_file("xiaohongshu", request.account_name)
-    is_ready = await xiaohongshu_setup(str(account_file), handle=False)
-    if not is_ready:
-        raise RuntimeError(
-            f"Xiaohongshu cookie is missing or expired: {account_file}. Run `sau xiaohongshu login --account {request.account_name}` first."
-        )
-
-    app = XiaoHongShuVideo(
-        title=request.title,
-        file_path=str(request.video_file),
-        desc=request.description,
-        tags=request.tags,
-        publish_date=request.publish_date,
-        account_file=str(account_file),
-        thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
-        publish_strategy=request.publish_strategy,
-        debug=request.debug,
-        headless=request.headless,
+    fingerprint = content_fingerprint(
+        request.title,
+        "\n".join((request.description, " ".join(request.tags))),
+        [request.video_file],
     )
-    await app.main()
+    with PublishGuard(
+        platform="xiaohongshu",
+        account_file=account_file,
+        fingerprint=fingerprint,
+        min_interval_minutes=request.min_publish_interval_minutes,
+        operation="upload-video",
+    ) as guard:
+        app = XiaoHongShuVideo(
+            title=request.title,
+            file_path=str(request.video_file),
+            desc=request.description,
+            tags=request.tags,
+            publish_date=request.publish_date,
+            account_file=str(account_file),
+            thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
+            publish_strategy=request.publish_strategy,
+            debug=request.debug,
+            headless=request.headless,
+            confirm_before_publish=request.confirm_before_publish,
+            content_source=request.content_source,
+            repost_source=request.repost_source,
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        try:
+            await app.main()
+        except Exception:
+            guard.set_failure_context(
+                stage="upload-video",
+                page_url=getattr(app, "publish_current_url", ""),
+            )
+            raise
+        finally:
+            if app.publish_succeeded:
+                guard.mark_success(
+                    success_url=app.publish_success_url,
+                    work_id=app.publish_work_id,
+                )
     return account_file
 
 
 async def upload_xiaohongshu_note(request: XiaohongshuNoteUploadRequest) -> Path:
+    if request.confirm_before_publish and request.headless:
+        raise RuntimeError("Xiaohongshu: manual publish confirmation requires headed mode")
     account_file = resolve_account_file("xiaohongshu", request.account_name)
-    is_ready = await xiaohongshu_setup(str(account_file), handle=False)
-    if not is_ready:
-        raise RuntimeError(
-            f"Xiaohongshu cookie is missing or expired: {account_file}. Run `sau xiaohongshu login --account {request.account_name}` first."
-        )
-
-    app = XiaoHongShuNote(
-        image_paths=[str(path) for path in request.image_files],
-        title=request.title,
-        desc=request.note,
-        note=request.note,
-        tags=request.tags,
-        publish_date=request.publish_date,
-        account_file=str(account_file),
-        publish_strategy=request.publish_strategy,
-        debug=request.debug,
-        headless=request.headless,
+    fingerprint = content_fingerprint(
+        request.title,
+        "\n".join((request.note, " ".join(request.tags))),
+        request.image_files,
     )
-    await app.main()
+    with PublishGuard(
+        platform="xiaohongshu",
+        account_file=account_file,
+        fingerprint=fingerprint,
+        min_interval_minutes=request.min_publish_interval_minutes,
+        operation="upload-note",
+    ) as guard:
+        app = XiaoHongShuNote(
+            image_paths=[str(path) for path in request.image_files],
+            title=request.title,
+            desc=request.note,
+            note=request.note,
+            tags=request.tags,
+            publish_date=request.publish_date,
+            account_file=str(account_file),
+            publish_strategy=request.publish_strategy,
+            debug=request.debug,
+            headless=request.headless,
+            confirm_before_publish=request.confirm_before_publish,
+            content_source=request.content_source,
+            repost_source=request.repost_source,
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        try:
+            await app.main()
+        except Exception:
+            guard.set_failure_context(
+                stage="upload-note",
+                page_url=getattr(app, "publish_current_url", ""),
+            )
+            raise
+        finally:
+            if app.publish_succeeded:
+                guard.mark_success(
+                    success_url=app.publish_success_url,
+                    work_id=app.publish_work_id,
+                )
     return account_file
 
 
@@ -781,12 +894,86 @@ def schedule_value(value: str):
         ) from exc
 
 
-def add_runtime_flags(parser: argparse.ArgumentParser) -> None:
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected a non-negative integer, got: {value}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"Expected a non-negative integer, got: {value}")
+    return parsed
+
+
+def add_runtime_flags(parser: argparse.ArgumentParser, *, headless_default: bool = True) -> None:
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     headless_group = parser.add_mutually_exclusive_group()
     headless_group.add_argument("--headed", dest="headless", action="store_false", help="Run with browser UI")
     headless_group.add_argument("--headless", dest="headless", action="store_true", help="Run in headless mode")
-    parser.set_defaults(headless=True)
+    parser.set_defaults(headless=headless_default)
+
+
+def add_publish_safety_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--automatic-publish",
+        dest="confirm_before_publish",
+        action="store_false",
+        help="Skip the terminal confirmation before the single publish click",
+    )
+    parser.add_argument(
+        "--min-publish-interval",
+        type=nonnegative_int,
+        default=30,
+        metavar="MINUTES",
+        help="Per-account cooldown after a successful publish (default: 30)",
+    )
+    parser.set_defaults(confirm_before_publish=True)
+
+
+def format_safety_status(status: dict) -> str:
+    lines = [f"安全状态: {status['platform']} / {status['account']}"]
+    state_status = status["state_status"]
+    if state_status == "missing":
+        lines.append("发布状态: 无发布记录")
+    elif state_status == "corrupt":
+        lines.append(f"发布状态: 状态文件损坏（{status.get('error', '未知错误')}）")
+    else:
+        last_success_at = status.get("last_success_at")
+        if last_success_at:
+            formatted_time = datetime.fromtimestamp(last_success_at).astimezone().isoformat(
+                timespec="seconds"
+            )
+            lines.append(f"上次成功: {formatted_time}")
+        else:
+            lines.append("上次成功: 无")
+        remaining = int(status.get("cooldown_remaining_seconds", 0) or 0)
+        lines.append(f"冷却状态: 还需 {remaining} 秒" if remaining else "冷却状态: 可发布")
+        lines.append(f"7日去重记录: {status.get('recent_count', 0)}")
+
+    lock = status["lock"]
+    if lock.get("pid") and lock.get("pid_alive"):
+        lines.append(f"发布锁: 运行中（PID {lock['pid']}）")
+    elif lock.get("exists") and lock.get("pid") not in (None, 0):
+        lines.append(f"发布锁: 残留（PID {lock['pid']} 不存在）")
+    elif lock.get("exists") and lock.get("pid") is None:
+        lines.append("发布锁: 无法识别归属")
+    else:
+        lines.append("发布锁: 空闲")
+
+    audit = status["audit"]
+    lines.append(
+        f"审计日志: {audit.get('size_bytes', 0)} bytes，"
+        f"{audit.get('backup_count', 0)} 个备份"
+    )
+    latest_failure = status.get("latest_failure")
+    if latest_failure:
+        lines.append(
+            f"最近失败: {latest_failure.get('stage', 'unknown')} / "
+            f"{latest_failure.get('error_type', 'Error')} / "
+            f"task_id={latest_failure.get('task_id', '')}"
+        )
+    else:
+        lines.append("最近失败: 无")
+    return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -796,6 +983,41 @@ def build_parser() -> argparse.ArgumentParser:
         description="CLI for social-auto-upload.",
     )
     platform_parsers = parser.add_subparsers(dest="platform", required=True)
+
+    safety_parser = platform_parsers.add_parser(
+        "safety",
+        help="Read local publishing safety status",
+    )
+    safety_actions = safety_parser.add_subparsers(dest="action", required=True)
+    safety_status_parser = safety_actions.add_parser(
+        "status",
+        help="Show local audit, cooldown, lock, and failure state",
+    )
+    safety_status_parser.add_argument(
+        "--platform",
+        dest="target_platform",
+        required=True,
+        choices=("douyin", "xiaohongshu"),
+        help="Governed publishing platform",
+    )
+    safety_status_parser.add_argument(
+        "--account",
+        required=True,
+        help="User-defined account_name",
+    )
+    safety_status_parser.add_argument(
+        "--min-publish-interval",
+        type=nonnegative_int,
+        default=30,
+        metavar="MINUTES",
+        help="Cooldown used for the read-only estimate (default: 30)",
+    )
+    safety_status_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Print structured JSON",
+    )
 
     douyin_parser = platform_parsers.add_parser("douyin", help="Douyin operations")
     douyin_actions = douyin_parser.add_subparsers(dest="action", required=True)
@@ -820,10 +1042,12 @@ def build_parser() -> argparse.ArgumentParser:
     upload_video_parser.add_argument("--product-title", default="", help="Optional product title")
     upload_video_parser.add_argument(
         "--declaration",
-        help="Exact Douyin self-declaration option text; omitted means do not set one",
+        required=True,
+        help="Exact Douyin declaration option text; use 'none' to explicitly choose no declaration",
     )
     upload_video_parser.add_argument("--collection", default=None, help="Optional collection name to add the work into (must already exist)")
-    add_runtime_flags(upload_video_parser)
+    add_runtime_flags(upload_video_parser, headless_default=False)
+    add_publish_safety_flags(upload_video_parser)
 
     upload_note_parser = douyin_actions.add_parser("upload-note", help="Upload one note to Douyin")
     upload_note_parser.add_argument("--account", required=True, help="Douyin user-defined account_name")
@@ -834,7 +1058,8 @@ def build_parser() -> argparse.ArgumentParser:
     upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     upload_note_parser.add_argument("--bgm", default="", help="BGM music name to search and select")
     upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
-    add_runtime_flags(upload_note_parser)
+    add_runtime_flags(upload_note_parser, headless_default=False)
+    add_publish_safety_flags(upload_note_parser)
 
     kuaishou_parser = platform_parsers.add_parser("kuaishou", help="Kuaishou operations")
     kuaishou_actions = kuaishou_parser.add_subparsers(dest="action", required=True)
@@ -882,7 +1107,10 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     xiaohongshu_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
     xiaohongshu_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
-    add_runtime_flags(xiaohongshu_upload_video_parser)
+    xiaohongshu_upload_video_parser.add_argument("--content-source", required=True, choices=("original", "repost"), help="Explicit content source decision")
+    xiaohongshu_upload_video_parser.add_argument("--repost-source", default="", help="Required media name when --content-source=repost")
+    add_runtime_flags(xiaohongshu_upload_video_parser, headless_default=False)
+    add_publish_safety_flags(xiaohongshu_upload_video_parser)
 
     xiaohongshu_upload_note_parser = xiaohongshu_actions.add_parser("upload-note", help="Upload one note to Xiaohongshu")
     xiaohongshu_upload_note_parser.add_argument("--account", required=True, help="Xiaohongshu user-defined account_name")
@@ -891,7 +1119,10 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_upload_note_parser.add_argument("--note", default="", help="Optional note content")
     xiaohongshu_upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     xiaohongshu_upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
-    add_runtime_flags(xiaohongshu_upload_note_parser)
+    xiaohongshu_upload_note_parser.add_argument("--content-source", required=True, choices=("original", "repost"), help="Explicit content source decision")
+    xiaohongshu_upload_note_parser.add_argument("--repost-source", default="", help="Required media name when --content-source=repost")
+    add_runtime_flags(xiaohongshu_upload_note_parser, headless_default=False)
+    add_publish_safety_flags(xiaohongshu_upload_note_parser)
 
     bilibili_parser = platform_parsers.add_parser("bilibili", help="Bilibili operations")
     bilibili_actions = bilibili_parser.add_subparsers(dest="action", required=True)
@@ -1037,6 +1268,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def dispatch(args: argparse.Namespace) -> int:
+    if args.platform == "safety":
+        if args.action != "status":
+            raise RuntimeError(f"Unsupported safety action: {args.action}")
+        account_file = (
+            resolve_runtime_home()
+            / "cookies"
+            / f"{args.target_platform}_{args.account}.json"
+        )
+        status = read_publish_safety_status(
+            platform=args.target_platform,
+            account_file=account_file,
+            min_interval_minutes=args.min_publish_interval,
+        )
+        if args.json_output:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(format_safety_status(status))
+        return 1 if status["state_status"] == "corrupt" else 0
+
     if args.platform == "douyin":
         if args.action == "login":
             result = await login_douyin_account(args.account, headless=args.headless)
@@ -1069,7 +1319,9 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
-                collection_name=args.collection,
+                collection_name=getattr(args, "collection", None),
+                confirm_before_publish=getattr(args, "confirm_before_publish", True),
+                min_publish_interval_minutes=getattr(args, "min_publish_interval", 30),
             )
             await upload_video(request)
             print(f"Douyin video upload submitted: {request.video_file}")
@@ -1078,7 +1330,7 @@ async def dispatch(args: argparse.Namespace) -> int:
         if args.action == "upload-note":
             # 如果指定了 --notef，读取文件内容作为 note
             note_content = args.note
-            if args.notef:
+            if getattr(args, "notef", ""):
                 note_file = Path(args.notef)
                 if not note_file.exists():
                     print(f"错误：文件不存在: {note_file}", file=sys.stderr)
@@ -1095,7 +1347,9 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
-                bgm=args.bgm or "",
+                bgm=getattr(args, "bgm", "") or "",
+                confirm_before_publish=getattr(args, "confirm_before_publish", True),
+                min_publish_interval_minutes=getattr(args, "min_publish_interval", 30),
             )
             await upload_note(request)
             print(f"Douyin note upload submitted: {len(request.image_files)} images")
@@ -1130,7 +1384,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
-                collection_name=args.collection,
+                collection_name=getattr(args, "collection", None),
             )
             await upload_kuaishou_video(request)
             print(f"Kuaishou video upload submitted: {request.video_file}")
@@ -1187,6 +1441,10 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                confirm_before_publish=getattr(args, "confirm_before_publish", True),
+                min_publish_interval_minutes=getattr(args, "min_publish_interval", 30),
+                content_source=args.content_source,
+                repost_source=args.repost_source,
             )
             await upload_xiaohongshu_video(request)
             print(f"Xiaohongshu video upload submitted: {request.video_file}")
@@ -1207,6 +1465,10 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                confirm_before_publish=getattr(args, "confirm_before_publish", True),
+                min_publish_interval_minutes=getattr(args, "min_publish_interval", 30),
+                content_source=args.content_source,
+                repost_source=args.repost_source,
             )
             await upload_xiaohongshu_note(request)
             print(f"Xiaohongshu note upload submitted: {len(request.image_files)} images")
@@ -1276,7 +1538,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
-                collection_name=args.collection,
+                collection_name=getattr(args, "collection", None),
             )
             await upload_tencent_video(request)
             print(f"Tencent/WeChat Channels video upload submitted: {request.video_file}")

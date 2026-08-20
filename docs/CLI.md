@@ -56,22 +56,49 @@ Windows 下推荐先指定镜像，再安装 Chromium：
 $env:PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"; patchright install chromium
 ```
 
+## 安全状态命令
+
+安全状态命令只读取本地文件，不启动浏览器、不访问平台，也不会创建或修改账号目录：
+
+```bash
+sau safety status --platform douyin --account <account_name>
+sau safety status --platform xiaohongshu --account <account_name>
+sau safety status --platform douyin --account <account_name> --json
+```
+
+命令显示上次成功时间、按 `--min-publish-interval` 估算的剩余冷却、7 日去重记录数、发布锁、审计日志大小和最近一次失败证据。状态文件损坏时命令会明确报告并返回非零退出码，不会把未知状态当成安全状态。
+
 ## 抖音 CLI 子命令
 
 ```bash
 sau douyin login --account <account_name>
 sau douyin login --account <account_name> --headless
 sau douyin check --account <account_name>
-sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags 运动,训练
+sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags 运动,训练 --declaration none
 sau douyin upload-note --account <account_name> --images videos/1.png videos/2.png --title "图文标题" --note "图文示例" --tags 图文,测试
 ```
 
-抖音短信验证码补充说明：
+抖音和小红书上传默认启用安全发布模式：
 
-- 视频发布过程中如果触发短信二次验证，CLI 会优先读取项目根目录下的 `verify_code.txt`
-- 如果未找到 `verify_code.txt`，并且当前命令是在交互式终端中手动运行，CLI 会直接在终端提示输入验证码
-- 对 agent、自动任务、远程桥接这类场景，仍然可以继续用写入 `verify_code.txt` 的方式喂验证码
-- 验证通过后，程序会自动清理 `verify_code.txt`
+- 浏览器可见，最终点击发布前需要在终端输入 `PUBLISH`
+- 同一平台只允许一个发布任务运行
+- 同一账号发布成功后默认冷却 30 分钟
+- 7 天内相同标题、正文和素材会被拦截
+- 检测到验证码、滑块、登录/验证跳转、账号异常、操作频繁、上传失败或系统繁忙时立即停止，不自动处理、不重复点击
+- 发布页导航返回 HTTP 4xx/5xx 时立即熔断；视频上传硬截止 15 分钟，图文上传硬截止 10 分钟
+- 审计记录和状态保存在账号文件目录下的 `.sau_safety/`；成功 URL 回执保存在 `.sau_safety/receipts/`
+- 审计日志达到 5 MiB 前自动轮转并保留 5 份；失败证据写入账号隔离的 `.sau_safety/evidence/` 子目录
+- 失败证据只含任务 ID、平台、账号、操作阶段、异常类型、脱敏原因和去掉查询参数/片段的页面 URL，不含页面正文、cookie、请求头或截图
+- 浏览器 profile/安全状态目录权限为 `0700`，cookie、审计、状态和回执文件权限为 `0600`
+
+可用 `--min-publish-interval MINUTES` 调整业务冷却时间。无人值守任务必须显式传入
+`--automatic-publish --headless`；这只关闭人工确认，不会关闭并发锁、重复内容拦截、风险熔断和审计。
+
+Phase 3C 治理决策保持现有使用方式：不增加每日数量上限，不强制 headed/人工确认，
+不禁用 `--automatic-publish`，也不延长默认冷却或限制发布时间段。这四项只有在用户明确
+重新批准后才能改变；并发锁、去重、风险熔断、审计和成功回执仍然强制生效。
+
+视频必须显式传 `--declaration`。确实无需声明时传 `--declaration none`；需要声明时传发布页显示的准确声明文本。程序不再自动选择“内容由AI生成”。
 
 ## 快手 CLI 子命令
 
@@ -87,9 +114,13 @@ sau kuaishou upload-note --account <account_name> --images videos/1.png videos/2
 ```bash
 sau xiaohongshu login --account <account_name>
 sau xiaohongshu check --account <account_name>
-sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags 小红书,视频
-sau xiaohongshu upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文示例" --tags 图文,测试
+sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags 小红书,视频 --content-source original
+sau xiaohongshu upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文示例" --tags 图文,测试 --content-source original
 ```
+
+`--content-source` 为必选项。原创内容传 `original`；转载内容传 `repost`，并同时填写 `--repost-source "媒体名称"`。缺少选择或转载来源时会在浏览器启动前停止。
+
+抖音和小红书会按账号复用 `cookies/.browser_profiles/` 下的独立持久化浏览器 profile。旧 cookie JSON 仅首次导入，后续登录状态由该 profile 延续；上传流程不再在 CLI 和 uploader 两层重复校验 cookie。每次发布任务都有唯一 `task_id`，平台成功 URL 已确认但 URL 中无法提取作品 ID 时，回执会标记 `manual_reconciliation_required`，不会为了补 ID 额外请求平台。
 
 海外环境如果无法登录默认创作者后台，可以通过环境变量切换到 RedNote 域名。该设置同时作用于登录、cookie 校验、视频发布和图文发布：
 
@@ -197,12 +228,12 @@ sau hupu upload-video --account <account_name> --file videos/demo.mp4 --title "�
 抖音、快手、小红书、视频号的图文或视频上传，以及 Bilibili 的视频上传支持 `--schedule`。只要传了 `--schedule`，CLI 就会自动切换到对应平台的定时发布策略；不传则默认立即发布。百家号、支付宝生活号、微博和虎扑当前不支持 `--schedule`。
 
 ```bash
-sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --schedule "2026-03-24 21:30"
+sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --declaration none --schedule "2026-03-24 21:30"
 sau douyin upload-note --account <account_name> --images videos/1.png videos/2.png --title "图文标题" --note "图文示例" --schedule "2026-03-24 21:30"
 sau kuaishou upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --schedule "2026-03-24 21:30"
 sau kuaishou upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文示例" --schedule "2026-03-24 21:30"
-sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --schedule "2026-03-24 21:30"
-sau xiaohongshu upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文示例" --schedule "2026-03-24 21:30"
+sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --content-source original --schedule "2026-03-24 21:30"
+sau xiaohongshu upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文示例" --content-source original --schedule "2026-03-24 21:30"
 sau bilibili upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tid 249 --schedule "2026-03-24 21:30"
 sau tencent upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --schedule "2026-03-24 21:30"
 ```
@@ -221,12 +252,12 @@ CLI 将 `debug` 和 `headless` 拆成了两个独立维度：
 - `--headless`: 无头模式运行
 - `--headed`: 有头模式运行
 
-如果都不传，CLI 当前默认按 `headless=True` 运行。
+如果都不传，普通平台仍按 `headless=True` 运行；抖音和小红书上传默认按 `headed` 运行。
 
 补充：
 
-- 抖音和快手的 CLI 默认都是无头模式
-- 如果用户明确要求可见浏览器窗口，或确实需要人工看页面，再显式传 `--headed`
+- 抖音和小红书上传默认显示浏览器并要求最终人工确认
+- 快手等其他现有 CLI 仍保持原来的无头默认值
 
 ## 视频上传参数
 

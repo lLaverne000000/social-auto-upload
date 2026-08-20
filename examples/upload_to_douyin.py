@@ -1,64 +1,54 @@
-"""Legacy direct-uploader example for Douyin.
+"""Douyin publishing examples through the governed unified CLI."""
 
-Current mainline usage prefers:
-    sau douyin login --account creator
-    sau douyin upload-video ...
-    sau douyin upload-note ...
-"""
-
-import asyncio
-from datetime import datetime
+import subprocess
+import sys
 from pathlib import Path
 
 from conf import BASE_DIR
-from uploader.douyin_uploader.main import (
-    DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
-    DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
-    DouYinNote,
-    DouYinVideo,
-)
 
 
-def upload_video_to_douyin():
-    account_file = Path(BASE_DIR / "cookies" / "douyin_uploader" / "account.json")
-    video_file_path = Path(BASE_DIR) / "videos/demo.mp4"
-    video_meta_title = "男子为了心爱之人每天坚守❤️‍🩹"
-    video_meta_hashtags = ["坚持不懈", "爱情执着", "奋斗使者", "短视频"]
-    thumbnail_landscape_path = Path(BASE_DIR) / "videos/demo.png"
-    thumbnail_portrait_path = Path(BASE_DIR) / "videos/demo.png"
-    video_meta_publish_time = datetime.strptime("2026-3-25 12:13", "%Y-%m-%d %H:%M")
+def _run_sau(*arguments: str) -> None:
+    subprocess.run([sys.executable, "-m", "sau_cli", *arguments], check=True)
 
-    app = DouYinVideo(
-        title=video_meta_title,
-        file_path=video_file_path,
-        tags=video_meta_hashtags,
-        publish_date=video_meta_publish_time,
-        thumbnail_landscape_path=thumbnail_landscape_path,
-        thumbnail_portrait_path=thumbnail_portrait_path,
-        account_file=account_file,
-        publish_strategy=DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
+
+def upload_video_to_douyin() -> None:
+    _run_sau(
+        "douyin",
+        "upload-video",
+        "--account",
+        "creator",
+        "--file",
+        str(Path(BASE_DIR) / "videos" / "demo.mp4"),
+        "--title",
+        "抖音视频示例",
+        "--desc",
+        "统一 CLI 安全发布示例",
+        "--tags",
+        "视频示例,安全发布",
+        "--declaration",
+        "none",
+        "--headed",
     )
-    asyncio.run(app.douyin_upload_video())
 
 
-def upload_note_to_douyin():
-    account_file = Path(BASE_DIR / "cookies" / "douyin_uploader" / "account.json")
-    image_paths = [Path(BASE_DIR) / "videos/demo.png", Path(BASE_DIR) / "videos/demo.png", Path(BASE_DIR) / "videos/demo.png"]
-    note = "图文内容示例"
-    tags = ["图文", "示例", "抖音图文"]
-    video_meta_publish_time = datetime.strptime("2026-3-25 12:13", "%Y-%m-%d %H:%M")
-
-    app = DouYinNote(
-        image_paths=image_paths,
-        note=note,
-        tags=tags,
-        publish_date=0,
-        account_file=account_file,
-        publish_strategy=DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
+def upload_note_to_douyin() -> None:
+    _run_sau(
+        "douyin",
+        "upload-note",
+        "--account",
+        "creator",
+        "--images",
+        str(Path(BASE_DIR) / "videos" / "demo1.png"),
+        str(Path(BASE_DIR) / "videos" / "demo2.png"),
+        "--title",
+        "抖音图文示例",
+        "--note",
+        "统一 CLI 安全发布示例",
+        "--tags",
+        "图文示例,安全发布",
+        "--headed",
     )
-    asyncio.run(app.douyin_upload_note())
 
 
 if __name__ == "__main__":
-    # upload_video_to_douyin()
     upload_note_to_douyin()

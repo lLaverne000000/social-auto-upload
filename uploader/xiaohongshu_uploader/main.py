@@ -14,12 +14,21 @@ from patchright.async_api import async_playwright
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils.browser_profile import launch_persistent_account_context
+from utils.browser_profile import save_secure_storage_state
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import xiaohongshu_logger
+from utils.risk_control import assert_no_risk_prompt
+from utils.risk_control import assert_healthy_navigation_response
+from utils.risk_control import extract_work_id
+from utils.risk_control import RiskControlError
+from utils.risk_control import require_cli_publish_permit
+from utils.risk_control import require_manual_publish_confirmation
+from utils.risk_control import StageDeadline
 
 XHS_DEFAULT_CREATOR_BASE_URL = "https://creator.xiaohongshu.com"
 XHS_CREATOR_BASE_URL_ENV = "SAU_XHS_CREATOR_BASE_URL"
@@ -179,12 +188,15 @@ async def cookie_auth(account_file):
         return False
 
     async with async_playwright() as playwright:
-        if LOCAL_CHROME_PATH:
-            browser = await playwright.chromium.launch(headless=True, executable_path=LOCAL_CHROME_PATH)
-        else:
-            browser = await playwright.chromium.launch(headless=True, channel="chromium")
+        context = await launch_persistent_account_context(
+            playwright.chromium,
+            account_file=account_file,
+            platform="xiaohongshu",
+            headless=True,
+            permissions=["geolocation"],
+            executable_path=LOCAL_CHROME_PATH or None,
+        )
         try:
-            context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(
@@ -213,7 +225,7 @@ async def cookie_auth(account_file):
             xiaohongshu_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
         finally:
-            await browser.close()
+            await context.close()
 
 
 async def xiaohongshu_setup(
@@ -253,8 +265,14 @@ async def xiaohongshu_cookie_gen(
     account_path.parent.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-        context = await browser.new_context()
+        context = await launch_persistent_account_context(
+            playwright.chromium,
+            account_file=account_file,
+            platform="xiaohongshu",
+            headless=headless,
+            permissions=["geolocation"],
+            executable_path=LOCAL_CHROME_PATH or None,
+        )
         context = await set_init_script(context)
         qrcode_path = None
         qrcode_info = None
@@ -269,19 +287,9 @@ async def xiaohongshu_cookie_gen(
             for _ in range(max_checks):
                 if await _is_xhs_login_completed(page):
                     await asyncio.sleep(2)
-                    await context.storage_state(path=account_file)
-                    if await cookie_auth(account_file):
-                        xiaohongshu_logger.success(_msg("🥳", "小红书扫码登录成功，小人开心收工"))
-                        result = _build_login_result(True, "success", "小红书扫码登录成功", account_file, qrcode_info, page.url)
-                    else:
-                        result = _build_login_result(
-                            False,
-                            "cookie_invalid",
-                            "小红书扫码流程结束，但 cookie 校验失败",
-                            account_file,
-                            qrcode_info,
-                            page.url,
-                        )
+                    await save_secure_storage_state(context, account_file)
+                    xiaohongshu_logger.success(_msg("🥳", "小红书扫码登录成功，小人开心收工"))
+                    result = _build_login_result(True, "success", "小红书扫码登录成功", account_file, qrcode_info, page.url)
                     return result
 
                 await asyncio.sleep(poll_interval)
@@ -302,7 +310,6 @@ async def xiaohongshu_cookie_gen(
             if not result["success"]:
                 xiaohongshu_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
         return result
 
 
@@ -314,6 +321,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        confirm_before_publish: bool = False,
+        publish_permit: object | None = None,
     ):
         self.publish_date = publish_date
         self.account_file = str(account_file)
@@ -322,6 +331,18 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.date_format = "%Y年%m月%d日 %H:%M"
         self.local_executable_path = LOCAL_CHROME_PATH
         self.headless = headless
+        self.confirm_before_publish = confirm_before_publish
+        self.publish_permit = publish_permit
+        self.publish_succeeded = False
+        self.publish_success_url = ""
+        self.publish_work_id = None
+        self.publish_current_url = ""
+
+    def _remember_page_url(self, page) -> None:
+        try:
+            self.publish_current_url = str(getattr(page, "url", "") or "")
+        except Exception:
+            pass
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
@@ -450,7 +471,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                     timeout=6000
                 )
                 first_item = page.locator('#creator-editor-topic-container .item').first
-                await first_item.wait_for(state="visible", timeout=4000)
+                await first_item.wait_for(state="visible", timeout=2000)
                 await first_item.click()
             except Exception as exc:
                 xiaohongshu_logger.warning(
@@ -466,15 +487,17 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         await self.fill_desc(page)
         await self.fill_tags(page)
 
-    async def check_original_declaration(self, page: Page) -> None:
-        """设置「来源转载」声明，填写转载来源。
+    async def apply_content_source_declaration(self, page: Page) -> None:
+        """按显式来源选择设置声明；原创不操作，转载必须完整填写来源。
 
         流程（对应 codegen 录制）：
           点「添加内容类型声明」→ 点包含「来源转载」的 div
           → 填 placeholder「请输入媒体名称」→ 点 button「确认」。
-        容错：任一步失败记 warning 跳过、继续发布，不中断。
+        任一步失败即停止发布，不自动跳过。
         """
-        source = getattr(self, "repost_source", "") or ""
+        if self.content_source == "original":
+            return
+        source = self.repost_source
         try:
             # 1. 点「添加内容类型声明」
             trigger = page.get_by_text("添加内容类型声明", exact=False).first
@@ -514,11 +537,11 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             await page.wait_for_timeout(1000)
             xiaohongshu_logger.success(_msg("🧾", f"来源转载已声明（来源：{source}）"))
         except Exception as exc:
-            xiaohongshu_logger.warning(_msg("⚠️", f"设置来源转载失败，跳过继续发布: {exc}"))
             try:
                 await page.keyboard.press("Escape")
             except Exception:
                 pass
+            raise RuntimeError(f"小红书: 设置来源转载失败，拒绝继续发布: {exc}") from exc
 
 
 class XiaoHongShuVideo(XiaoHongShuBaseUploader):
@@ -534,6 +557,10 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        confirm_before_publish: bool = False,
+        content_source: str | None = None,
+        repost_source: str = "",
+        publish_permit: object | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -541,14 +568,19 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            confirm_before_publish=confirm_before_publish,
+            publish_permit=publish_permit,
         )
         self.title = title
         self.file_path = file_path
         self.tags = tags or []
         self.thumbnail_path = thumbnail_path
         self.desc = desc or ""
+        self.content_source = content_source
+        self.repost_source = repost_source.strip()
 
     async def validate_upload_args(self):
+        self._validate_content_source()
         await self.validate_base_args()
         if not self.title or not str(self.title).strip():
             raise ValueError("视频模式下，title 是必须的")
@@ -557,9 +589,14 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         if self.thumbnail_path:
             self.thumbnail_path = str(self.validate_image_file(self.thumbnail_path))
 
+    def _validate_content_source(self) -> None:
+        if self.content_source not in {"original", "repost"}:
+            raise ValueError("小红书: 必须显式选择 content_source=original 或 repost")
+        if self.content_source == "repost" and not self.repost_source:
+            raise ValueError("小红书: content_source=repost 时必须填写 repost_source")
+
     async def handle_upload_error(self, page: Page):
-        xiaohongshu_logger.warning(_msg("😵", "视频上传摔了一跤，小人马上重新上传"))
-        await page.locator('div.progress-div [class^="upload-btn-input"]').set_input_files(self.file_path)
+        raise RuntimeError("小红书视频上传失败，风控模式不会自动重试；请检查页面后重新发起任务")
 
     async def set_thumbnail(self, page: Page, thumbnail_path: str):
         if not thumbnail_path:
@@ -621,16 +658,25 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 pass
 
     async def upload_video_content(self, page: Page) -> None:
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
+        upload_deadline = StageDeadline("小红书", "视频上传", 900)
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往视频发布页"))
         publish_url = _build_xhs_creator_url(
             "/publish/publish?from=homepage&target=video"
         )
-        await page.goto(publish_url)
+        navigation_response = await page.goto(publish_url)
+        assert_healthy_navigation_response(
+            navigation_response,
+            "小红书",
+            "进入视频上传页",
+        )
         await page.wait_for_url(publish_url)
+        await assert_no_risk_prompt(page, "小红书", "进入上传页后")
         await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
 
         while True:
+            upload_deadline.raise_if_expired()
             try:
                 upload_input = await page.wait_for_selector('input.upload-input', timeout=3000)
                 preview_new = await upload_input.query_selector(
@@ -664,61 +710,84 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                         xiaohongshu_logger.success(_msg("🥳", "虽然没看到预览区，但标题框出来了，小人继续"))
                         break
                     xiaohongshu_logger.debug(_msg("🧍", "还没拿到预览区域，小人继续等一会"))
+                await assert_no_risk_prompt(page, "小红书", "素材上传过程中")
+            except RiskControlError:
+                raise
             except Exception as e:
+                await assert_no_risk_prompt(page, "小红书", "素材上传过程中")
                 xiaohongshu_logger.debug(_msg("😵", f"上传状态还没稳定下来，小人继续观察: {e}"))
             await asyncio.sleep(2)
+
+        await assert_no_risk_prompt(page, "小红书", "素材上传完成后")
 
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
 
         await self.set_thumbnail(page, self.thumbnail_path)
+        await assert_no_risk_prompt(page, "小红书", "编辑完成后")
 
         # await self.set_location(page, "青岛市")
 
-        await self.check_original_declaration(page)
+        await self.apply_content_source_declaration(page)
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
-            try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
-                await page.wait_for_url(
-                    XHS_PUBLISH_SUCCESS_URL_PATTERN,
-                    timeout=3000
-                )
-                xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
-                break
-            except Exception:
-                xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
-                await asyncio.sleep(0.5)
+        await assert_no_risk_prompt(page, "小红书")
+        await require_manual_publish_confirmation(
+            platform="小红书",
+            content_type="视频",
+            headless=self.headless,
+            enabled=self.confirm_before_publish,
+        )
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
+        button_text = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
+        publish_button = page.get_by_role("button", name=button_text, exact=True)
+        if not await publish_button.count():
+            raise RuntimeError(f"小红书: 未找到“{button_text}”按钮，已停止且不会自动重试")
+        await publish_button.click()
+        try:
+            await page.wait_for_url(XHS_PUBLISH_SUCCESS_URL_PATTERN, timeout=60000)
+            await assert_no_risk_prompt(page, "小红书", "发布成功页")
+            success_url = str(page.url)
+            self.publish_success_url = success_url
+            self.publish_work_id = extract_work_id(success_url)
+            self.publish_succeeded = True
+        except Exception as exc:
+            self.publish_succeeded = False
+            self.publish_success_url = ""
+            self.publish_work_id = None
+            await assert_no_risk_prompt(page, "小红书")
+            raise RuntimeError("小红书: 60 秒内未确认发布成功，已停止且不会重复点击") from exc
+        xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
 
     async def upload(self, playwright: Playwright) -> None:
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
+        context = await launch_persistent_account_context(
+            playwright.chromium,
+            account_file=self.account_file,
+            platform="xiaohongshu",
+            headless=self.headless,
             permissions=["geolocation"],
-            storage_state=self.account_file,
         )
         context = await set_init_script(context)
 
+        page = None
         try:
             page = await context.new_page()
             await self.upload_video_content(page)
-            await context.storage_state(path=self.account_file)
+            await save_secure_storage_state(context, self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
+            if page is not None:
+                self._remember_page_url(page)
             await context.close()
-            await browser.close()
 
     async def xiaohongshu_upload_video(self):
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
         async with async_playwright() as playwright:
             await self.upload(playwright)
 
@@ -739,6 +808,10 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        confirm_before_publish: bool = False,
+        content_source: str | None = None,
+        repost_source: str = "",
+        publish_permit: object | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -746,14 +819,22 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            confirm_before_publish=confirm_before_publish,
+            publish_permit=publish_permit,
         )
         self.image_paths = image_paths
         self.note = note or ""
         self.tags = tags or []
         self.desc = desc if desc is not None else self.note
         self.title = title or ((self.desc or self.note)[:20] if (self.desc or self.note) else "")
+        self.content_source = content_source
+        self.repost_source = repost_source.strip()
 
     async def validate_upload_args(self):
+        if self.content_source not in {"original", "repost"}:
+            raise ValueError("小红书: 必须显式选择 content_source=original 或 repost")
+        if self.content_source == "repost" and not self.repost_source:
+            raise ValueError("小红书: content_source=repost 时必须填写 repost_source")
         await self.validate_base_args()
         if not self.image_paths:
             raise ValueError("图文模式下，图片是必须的")
@@ -769,13 +850,21 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         self.image_paths = normalized_image_paths
 
     async def upload_note_content(self, page: Page) -> None:
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
+        upload_deadline = StageDeadline("小红书", "图文上传", 600)
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
         publish_url = _build_xhs_creator_url(
             "/publish/publish?from=homepage&target=image"
         )
-        await page.goto(publish_url)
+        navigation_response = await page.goto(publish_url)
+        assert_healthy_navigation_response(
+            navigation_response,
+            "小红书",
+            "进入图文上传页",
+        )
         await page.wait_for_url(publish_url)
+        await assert_no_risk_prompt(page, "小红书", "进入上传页后")
 
         upload_input = page.locator('input[type="file"][accept*="image"]').first
         if not await upload_input.count():
@@ -786,62 +875,83 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         await upload_input.set_input_files(self.image_paths)
 
         while True:
+            upload_deadline.raise_if_expired()
             try:
                 title_container = page.locator('input[placeholder*="填写标题"]').first
                 await title_container.wait_for(state="visible", timeout=3000)
                 xiaohongshu_logger.success(_msg("🥳", "图文素材已经传完，可以开始填写内容了"))
                 break
             except Exception:
+                await assert_no_risk_prompt(page, "小红书", "素材上传过程中")
                 xiaohongshu_logger.debug(_msg("🧍", "图文素材还在上传，小人继续等一会"))
                 await asyncio.sleep(1)
 
+        await assert_no_risk_prompt(page, "小红书", "素材上传完成后")
+
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
+        await assert_no_risk_prompt(page, "小红书", "编辑完成后")
 
-        await self.check_original_declaration(page)
+        await self.apply_content_source_declaration(page)
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
-            try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
-                await page.wait_for_url(
-                    XHS_PUBLISH_SUCCESS_URL_PATTERN,
-                    timeout=3000
-                )
-                xiaohongshu_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
-                break
-            except Exception:
-                xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
-                await asyncio.sleep(0.5)
+        await assert_no_risk_prompt(page, "小红书")
+        await require_manual_publish_confirmation(
+            platform="小红书",
+            content_type="图文",
+            headless=self.headless,
+            enabled=self.confirm_before_publish,
+        )
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
+        button_text = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
+        publish_button = page.get_by_role("button", name=button_text, exact=True)
+        if not await publish_button.count():
+            raise RuntimeError(f"小红书: 未找到“{button_text}”按钮，已停止且不会自动重试")
+        await publish_button.click()
+        try:
+            await page.wait_for_url(XHS_PUBLISH_SUCCESS_URL_PATTERN, timeout=60000)
+            await assert_no_risk_prompt(page, "小红书", "发布成功页")
+            success_url = str(page.url)
+            self.publish_success_url = success_url
+            self.publish_work_id = extract_work_id(success_url)
+            self.publish_succeeded = True
+        except Exception as exc:
+            self.publish_succeeded = False
+            self.publish_success_url = ""
+            self.publish_work_id = None
+            await assert_no_risk_prompt(page, "小红书")
+            raise RuntimeError("小红书: 60 秒内未确认发布成功，已停止且不会重复点击") from exc
+        xiaohongshu_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
 
     async def upload(self, playwright: Playwright) -> None:
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
+        context = await launch_persistent_account_context(
+            playwright.chromium,
+            account_file=self.account_file,
+            platform="xiaohongshu",
+            headless=self.headless,
             permissions=["geolocation"],
-            storage_state=self.account_file,
         )
         context = await set_init_script(context)
 
+        page = None
         try:
             page = await context.new_page()
             await self.upload_note_content(page)
-            await context.storage_state(path=self.account_file)
+            await save_secure_storage_state(context, self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
+            if page is not None:
+                self._remember_page_url(page)
             await context.close()
-            await browser.close()
 
     async def xiaohongshu_upload_note(self):
+        require_cli_publish_permit(self.publish_permit, "xiaohongshu")
         async with async_playwright() as playwright:
             await self.upload(playwright)
 

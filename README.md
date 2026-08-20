@@ -144,7 +144,7 @@ AI的发展毋庸置疑，希望你遇到这种安装和使用，不要再怯场
 
 接下来这段时间，这个仓库应该会进入一个相对密集更新的阶段。我现在最想先做的事情主要有这几件：
 
-1. 使用更隐蔽、更稳定的自动化方案，尽量降低平台检测风险
+1. 增加人工确认、发布冷却、并发锁、重复内容拦截和风险提示熔断
 2. 补齐一些常用平台的图文能力，并逐步完成 CLI 化、Skill 化
 3. 陆续测试并上架到更多 skill 平台，让大家的龙虾、螃蟹、毛毛虫都能打通 AI 自媒体的最后一道关
 
@@ -157,12 +157,14 @@ AI的发展毋庸置疑，希望你遇到这种安装和使用，不要再怯场
 - 各平台 uploader 的结构收敛
 - CLI 统一接入
 - 面向 OpenClaw、Codex、 Claude Code 等工具的 skill 化
-- 更换为 `patchright` 驱动，提升兼容性与隐蔽性
-- 主线优先围绕无头模式推进
+- 使用 `patchright` 驱动以维持浏览器兼容性，不注入 anti-detection 脚本
+- 抖音和小红书上传默认使用有头模式，并在最终发布前要求人工确认
+- 抖音和小红书的上传等待有硬截止时间；登录/验证跳转、HTTP 4xx/5xx、上传失败和平台繁忙提示会立即熔断
+- 发布锁记录进程 PID，成功任务保存带 `task_id` 的本地回执，cookie、审计和回执使用仅当前用户可读写的权限
 
-“无头模式（headless）”，指的是浏览器在后台运行，不弹出可见窗口，但自动化流程仍然会照常执行。这样更适合 CLI、服务端、自动任务和 agent 场景。
+“无头模式（headless）”，指的是浏览器在后台运行，不弹出可见窗口。抖音和小红书的安全默认值是有头模式；只有明确传入 `--automatic-publish` 才会跳过最终人工确认，无人值守时还需同时传 `--headless`。
 
-Web 端相关代码仍然保留，但已经不是当前主线，不保证可直接运行，也不保证与当前 uploader/CLI 完全同步。
+Web 端相关代码仍然保留，但抖音和小红书的旧 Web/批量发布入口已禁用；这两个平台必须通过统一 `sau` CLI 发布。
 
 
 ## 🏁快速开始
@@ -174,7 +176,7 @@ Web 端相关代码仍然保留，但已经不是当前主线，不保证可直�
 ```bash
 sau douyin login --account <account_name>
 sau douyin check --account <account_name>
-sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介"
+sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --declaration none
 sau douyin upload-note --account <account_name> --images videos/1.png videos/2.png --title "图文标题" --note "图文正文"
 
 sau kuaishou login --account <account_name>
@@ -184,8 +186,8 @@ sau kuaishou upload-note --account <account_name> --images videos/1.png videos/2
 
 sau xiaohongshu login --account <account_name>
 sau xiaohongshu check --account <account_name>
-sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介"
-sau xiaohongshu upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文正文"
+sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --content-source original
+sau xiaohongshu upload-note --account <account_name> --images videos/1.png videos/2.png videos/3.png --title "图文标题" --note "图文正文" --content-source original
 
 sau bilibili login --account <account_name>
 sau bilibili check --account <account_name>
@@ -226,8 +228,12 @@ sau youtube upload-video --account <account_name> --file videos/demo.mp4 --title
 补充说明：
 
 - `creator` 之类的名字只是示例值，真正含义是 `account_name`
-- 一个 `account_name` 对应一个账号文件，可以准备多个账号，也可以按账号名并发执行任务
-- 抖音视频发布若触发短信二次验证，程序会优先读取项目根目录下的 `verify_code.txt`；如果你是在本地交互式终端手动运行 CLI，也可以直接按终端提示输入验证码
+- 一个 `account_name` 对应一个账号文件；安全发布模式禁止同一平台并发执行发布任务
+- 抖音或小红书触发验证码、滑块、登录/验证跳转、账号异常、操作频繁、上传失败或 HTTP 错误时会立即熔断，请在官方页面人工处理后重新发起任务
+- 视频上传硬截止 15 分钟，图文上传硬截止 10 分钟；成功 URL 回执保存在账号目录的 `.sau_safety/receipts/`
+- 可用 `sau safety status --platform douyin --account <account_name>` 或把平台改为 `xiaohongshu`，只读查看冷却、锁、审计和最近失败状态；附加 `--json` 可输出 JSON
+- 审计日志每 5 MiB 自动轮转并保留 5 份；失败时只保存脱敏元数据到 `.sau_safety/evidence/`，不保存页面正文、cookie 或截图
+- 治理策略不增加每日发布上限，不强制 headed/人工确认，不禁用 `--automatic-publish`，不延长默认冷却或限制发布时间段；底层并发锁、去重、熔断和审计保持强制
 - 浏览器平台统一约定：
 - 视频使用 `title + desc + tags`
 - 图文使用 `title + note + tags`

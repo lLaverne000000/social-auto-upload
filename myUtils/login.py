@@ -5,16 +5,16 @@ from playwright.async_api import async_playwright
 
 from myUtils.auth import check_cookie
 from utils.base_social_media import set_init_script
+from utils.browser_profile import save_secure_storage_state
 import uuid
 from pathlib import Path
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 
-# 统一获取浏览器启动配置（防风控+引入本地浏览器）
+# 统一获取浏览器启动配置；不隐藏自动化特征
 def get_browser_options():
     options = {
         'headless': LOCAL_CHROME_HEADLESS,
         'args': [
-            '--disable-blink-features=AutomationControlled',  # 核心防爬屏蔽：去掉 window.navigator.webdriver 标签
             '--lang=zh-CN',
             '--disable-infobars',
             '--start-maximized'
@@ -68,7 +68,7 @@ async def douyin_cookie_gen(id,status_queue):
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
+        await save_secure_storage_state(context, cookies_dir / f"{uuid_v1}.json")
         result = await check_cookie(3, f"{uuid_v1}.json")
         if not result:
             status_queue.put("500")
@@ -146,7 +146,7 @@ async def get_tencent_cookie(id,status_queue):
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
+        await save_secure_storage_state(context, cookies_dir / f"{uuid_v1}.json")
         result = await check_cookie(2,f"{uuid_v1}.json")
         if not result:
             status_queue.put("500")
@@ -220,7 +220,7 @@ async def get_ks_cookie(id,status_queue):
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
+        await save_secure_storage_state(context, cookies_dir / f"{uuid_v1}.json")
         result = await check_cookie(4, f"{uuid_v1}.json")
         if not result:
             status_queue.put("500")
@@ -294,7 +294,7 @@ async def xiaohongshu_cookie_gen(id,status_queue):
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
+        await save_secure_storage_state(context, cookies_dir / f"{uuid_v1}.json")
         result = await check_cookie(1, f"{uuid_v1}.json")
         if not result:
             status_queue.put("500")

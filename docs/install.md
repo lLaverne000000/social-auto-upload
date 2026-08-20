@@ -102,7 +102,7 @@ sau bilibili --help
 ```bash
 sau douyin login --account <account_name>
 sau douyin check --account <account_name>
-sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介"
+sau douyin upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --declaration none
 图文正文1:
 $noteText = @"图文正文"@    
 sau douyin upload-note --account <account_name> --images videos/demo1.png videos/demo2.png --title "图文标题" --note $noteText --tags 'tag1,tag2'
@@ -112,12 +112,16 @@ sau douyin upload-note --account <account_name> --images videos/demo1.png videos
 sau douyin upload-note --account <account_name> --images videos/demo1.png videos/demo2.png --title "图文标题" --note $noteText --tags 'tag1,tag2' --bgm '音乐名称'
 ``` 
 
-抖音短信验证码补充说明：
+抖音和小红书安全发布说明：
 
-- 视频发布过程中如果触发短信二次验证，程序会优先读取项目根目录下的 `verify_code.txt`
-- 如果当前是你手动运行的交互式终端，没提供 `verify_code.txt` 时，CLI 会直接提示你在终端输入验证码
-- 如果是 agent 或自动化桥接场景，仍然可以继续通过写入 `verify_code.txt` 来提供验证码
-- 验证通过后，程序会自动删除 `verify_code.txt`
+- 默认使用可见浏览器，并在最终发布前要求终端输入 `PUBLISH`
+- 同一平台禁止并发发布，同一账号成功发布后默认冷却 30 分钟
+- 7 天内相同内容会被拦截
+- 如果触发验证码、滑块、登录/验证跳转、账号异常、操作频繁、上传失败或 HTTP 4xx/5xx，程序立即停止且不自动重试
+- 视频上传最长等待 15 分钟，图文上传最长等待 10 分钟，超过后硬熔断
+- cookie、审计、状态和成功回执使用仅当前用户可读写的文件权限；回执位于账号目录的 `.sau_safety/receipts/`
+- 审计日志每 5 MiB 自动轮转并保留 5 份；失败证据为脱敏 JSON，位于 `.sau_safety/evidence/`，不保存截图
+- 用 `sau safety status --platform douyin --account <account_name>`（或 `xiaohongshu`）只读查看本地治理状态，附加 `--json` 输出结构化结果
 
 抖音卡login手动获取cookie:
 
@@ -140,9 +144,11 @@ sau kuaishou upload-note --account <account_name> --images videos/demo1.png vide
 ```bash
 sau xiaohongshu login --account <account_name>
 sau xiaohongshu check --account <account_name>
-sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介"
-sau xiaohongshu upload-note --account <account_name> --images videos/demo1.png videos/demo2.png videos/demo.png --title "图文标题" --note "图文正文"
+sau xiaohongshu upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --content-source original
+sau xiaohongshu upload-note --account <account_name> --images videos/demo1.png videos/demo2.png videos/demo.png --title "图文标题" --note "图文正文" --content-source original
 ```
+
+小红书转载内容改传 `--content-source repost --repost-source "媒体名称"`。抖音视频必须显式传 `--declaration`，无需声明时使用 `--declaration none`。
 
 ### 10. Bilibili 主线示例
 

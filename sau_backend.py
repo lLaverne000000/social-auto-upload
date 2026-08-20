@@ -441,6 +441,12 @@ def postVideo():
         return jsonify({"code": 400, "msg": "平台类型不能为空", "data": None}), 400
     if not title:
         return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
+    if type in (1, 3):
+        return jsonify({
+            "code": 410,
+            "msg": "旧 Web 小红书/抖音发布入口已禁用，请使用 sau CLI 的统一安全入口",
+            "data": None,
+        }), 410
 
     # 打印获取到的数据（仅作为示例）
     print("File List:", file_list)
@@ -527,6 +533,12 @@ def postVideoBatch():
         file_list = data.get('fileList', [])
         account_list = data.get('accountList', [])
         type = data.get('type')
+        if type in (1, 3):
+            return jsonify({
+                "code": 410,
+                "msg": "旧 Web 批量小红书/抖音发布入口已禁用，请使用 sau CLI 的统一安全入口",
+                "data": None,
+            }), 410
         title = data.get('title')
         tags = data.get('tags')
         category = data.get('category')

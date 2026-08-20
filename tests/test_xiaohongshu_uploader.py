@@ -3,9 +3,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import uploader.xiaohongshu_uploader.main as xhs_main
+from utils.risk_control import _issue_cli_publish_permit
+from utils.risk_control import RiskControlError
 
 
 class FakeLocator:
@@ -90,6 +92,100 @@ class RecordingPage:
 
 
 class XiaohongshuUploaderTests(unittest.TestCase):
+    @staticmethod
+    def _video_polling_page(preview_text: str):
+        response = MagicMock(status=200, url="https://creator.xiaohongshu.com/publish")
+        page = MagicMock(url="https://creator.xiaohongshu.com/publish")
+        page.goto = AsyncMock(return_value=response)
+        page.wait_for_url = AsyncMock()
+        page.locator.return_value.set_input_files = AsyncMock()
+        preview = MagicMock()
+        preview.inner_text = AsyncMock(return_value=preview_text)
+        preview.query_selector_all = AsyncMock(return_value=[])
+        upload_input = MagicMock()
+        upload_input.query_selector = AsyncMock(return_value=preview)
+        page.wait_for_selector = AsyncMock(return_value=upload_input)
+        return page
+
+    def test_video_upload_rejects_unhealthy_navigation_response(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="demo",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            content_source="original",
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        response = MagicMock(status=503, url="https://creator.xiaohongshu.com/publish")
+        page = MagicMock(url="https://creator.xiaohongshu.com/publish")
+        page.goto = AsyncMock(return_value=response)
+        page.wait_for_url = AsyncMock()
+        page.locator.return_value.set_input_files = AsyncMock()
+        page.wait_for_selector = AsyncMock(side_effect=TimeoutError("not ready"))
+
+        with (
+            patch.object(xhs_main, "assert_no_risk_prompt", new=AsyncMock()),
+            patch.object(xhs_main.xiaohongshu_logger, "debug"),
+            self.assertRaisesRegex(RiskControlError, "HTTP 503"),
+        ):
+            asyncio.run(asyncio.wait_for(app.upload_video_content(page), timeout=0.1))
+
+    def test_video_upload_checks_risk_after_each_unsuccessful_poll(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="demo",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            content_source="original",
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        page = self._video_polling_page("正在上传 50%")
+
+        async def risk_check(_page, _platform, stage="当前阶段"):
+            if stage == "素材上传过程中":
+                raise RiskControlError("risk prompt")
+
+        with (
+            patch.object(xhs_main, "assert_no_risk_prompt", side_effect=risk_check),
+            patch.object(xhs_main.xiaohongshu_logger, "debug"),
+            self.assertRaisesRegex(RiskControlError, "risk prompt"),
+        ):
+            asyncio.run(asyncio.wait_for(app.upload_video_content(page), timeout=0.1))
+
+    def test_success_page_risk_does_not_set_publish_succeeded(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="demo",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            content_source="original",
+            publish_permit=_issue_cli_publish_permit(),
+        )
+        page = self._video_polling_page("上传成功")
+        publish_button = MagicMock()
+        publish_button.count = AsyncMock(return_value=1)
+        publish_button.click = AsyncMock()
+        page.get_by_role.return_value = publish_button
+        app.fill_meta = AsyncMock()
+        app.set_thumbnail = AsyncMock()
+        app.apply_content_source_declaration = AsyncMock()
+
+        async def risk_check(_page, _platform, stage="当前阶段"):
+            if stage == "发布成功页":
+                raise RiskControlError("success page risk")
+
+        with (
+            patch.object(xhs_main, "assert_no_risk_prompt", side_effect=risk_check),
+            self.assertRaisesRegex(RuntimeError, "未确认发布成功"),
+        ):
+            asyncio.run(app.upload_video_content(page))
+
+        self.assertFalse(app.publish_succeeded)
+        self.assertEqual(app.publish_success_url, "")
+
     def test_creator_urls_keep_xiaohongshu_domain_by_default(self):
         with patch.dict(os.environ, {"SAU_XHS_CREATOR_BASE_URL": ""}):
             self.assertEqual(
@@ -193,6 +289,7 @@ class XiaohongshuUploaderTests(unittest.TestCase):
                 publish_date=0,
                 account_file=str(cookie_path),
                 thumbnail_path=str(thumbnail_path),
+                content_source="original",
             )
 
             with patch(

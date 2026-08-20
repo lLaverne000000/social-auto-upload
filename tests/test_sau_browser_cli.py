@@ -33,6 +33,8 @@ class BrowserCliParserTests(unittest.TestCase):
                     "标题",
                     "--desc",
                     "视频简介",
+                    "--declaration",
+                    "none",
                 ]
             )
 
@@ -62,6 +64,8 @@ class BrowserCliParserTests(unittest.TestCase):
                     str(landscape_path),
                     "--thumbnail-portrait",
                     str(portrait_path),
+                    "--declaration",
+                    "none",
                 ]
             )
 
@@ -84,11 +88,11 @@ class BrowserCliParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             video_path = Path(tmp_dir) / "demo.mp4"
             video_path.write_bytes(b"video")
-            args = sau_cli.build_parser().parse_args([
-                "douyin", "upload-video", "--account", "creator",
-                "--file", str(video_path), "--title", "标题",
-            ])
-        self.assertIsNone(args.declaration)
+            with self.assertRaises(SystemExit):
+                sau_cli.build_parser().parse_args([
+                    "douyin", "upload-video", "--account", "creator",
+                    "--file", str(video_path), "--title", "标题",
+                ])
 
     def test_douyin_request_legacy_positional_runtime_flags_keep_their_meaning(self):
         request = sau_cli.DouyinVideoUploadRequest(
@@ -154,7 +158,7 @@ class BrowserCliParserTests(unittest.TestCase):
         self.assertEqual(args.title, "图文标题")
         self.assertEqual(args.note, "图文正文")
 
-    def test_xiaohongshu_upload_video_defaults_to_headless(self):
+    def test_xiaohongshu_upload_video_defaults_to_safe_headed_mode(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             video_path = Path(tmp_dir) / "demo.mp4"
             video_path.write_bytes(b"video")
@@ -170,10 +174,38 @@ class BrowserCliParserTests(unittest.TestCase):
                     str(video_path),
                     "--title",
                     "视频标题",
+                    "--content-source",
+                    "original",
+                ]
+            )
+
+        self.assertFalse(args.headless)
+        self.assertTrue(args.confirm_before_publish)
+
+    def test_douyin_automatic_publish_is_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+            args = sau_cli.build_parser().parse_args(
+                [
+                    "douyin",
+                    "upload-video",
+                    "--account",
+                    "creator",
+                    "--file",
+                    str(video_path),
+                    "--title",
+                    "标题",
+                    "--automatic-publish",
+                    "--headless",
+                    "--declaration",
+                    "none",
                 ]
             )
 
         self.assertTrue(args.headless)
+        self.assertFalse(args.confirm_before_publish)
+        self.assertEqual(args.min_publish_interval, 30)
 
     def test_xiaohongshu_upload_note_accepts_headed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -194,6 +226,8 @@ class BrowserCliParserTests(unittest.TestCase):
                     "--note",
                     "图文正文",
                     "--headed",
+                    "--content-source",
+                    "original",
                 ]
             )
 
@@ -312,6 +346,8 @@ class BrowserCliDispatchTests(unittest.TestCase):
             thumbnail=None,
             debug=False,
             headless=False,
+            content_source="original",
+            repost_source="",
         )
         with patch("sau_cli.upload_xiaohongshu_video", new=AsyncMock()) as mock_upload:
             asyncio.run(sau_cli.dispatch(args))
@@ -333,6 +369,8 @@ class BrowserCliDispatchTests(unittest.TestCase):
             schedule=0,
             debug=False,
             headless=True,
+            content_source="original",
+            repost_source="",
         )
         with patch("sau_cli.upload_xiaohongshu_note", new=AsyncMock()) as mock_upload:
             asyncio.run(sau_cli.dispatch(args))

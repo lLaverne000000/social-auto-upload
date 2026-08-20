@@ -35,6 +35,3 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["uploader*", "utils*", "myUtils*"]
-
-[tool.setuptools.package-data]
-utils = ["stealth.min.js"]
