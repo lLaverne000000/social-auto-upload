@@ -280,12 +280,14 @@ if (-not $BrowserSourceItem.PSIsContainer -or
     throw "Browser source must be a real directory: $BrowserSourcePath"
 }
 
-$PythonPath = (Get-Command -Name $PythonExecutable -CommandType Application -ErrorAction Stop).Source
-$NpmPath = (Get-Command -Name 'npm.cmd' -CommandType Application -ErrorAction Stop).Source
+$PythonCommand = Get-Command -Name $PythonExecutable -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$NpmCommand = Get-Command -Name 'npm.cmd' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$PythonPath = [string]$PythonCommand.Source
+$NpmPath = [string]$NpmCommand.Source
 if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
-    $InnoCommand = Get-Command -Name 'ISCC.exe' -CommandType Application -ErrorAction SilentlyContinue
+    $InnoCommand = Get-Command -Name 'ISCC.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $InnoCommand) {
-        $InnoCompiler = $InnoCommand.Source
+        $InnoCompiler = [string]$InnoCommand.Source
     } else {
         $Candidates = @(
             (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),

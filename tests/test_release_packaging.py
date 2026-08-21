@@ -590,6 +590,27 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertIn("[IO.Path]::GetDirectoryName($InstallDir)", workflow)
         self.assertIn("[IO.Path]::GetFileName($InstallDir)", workflow)
 
+    def test_windows_builder_selects_one_executable_from_duplicate_path_matches(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        self.assertIn(
+            "$PythonCommand = Get-Command -Name $PythonExecutable -CommandType Application "
+            "-ErrorAction Stop | Select-Object -First 1",
+            source,
+        )
+        self.assertIn(
+            "$NpmCommand = Get-Command -Name 'npm.cmd' -CommandType Application "
+            "-ErrorAction Stop | Select-Object -First 1",
+            source,
+        )
+        self.assertIn(
+            "$InnoCommand = Get-Command -Name 'ISCC.exe' -CommandType Application "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1",
+            source,
+        )
+        self.assertIn("$PythonPath = [string]$PythonCommand.Source", source)
+        self.assertIn("$NpmPath = [string]$NpmCommand.Source", source)
+        self.assertIn("$InnoCompiler = [string]$InnoCommand.Source", source)
+
     def test_windows_builder_preserves_old_installer_until_verified_temporary_output_exists(self):
         self.assertTrue(self.build_script.is_file(), "Windows build wrapper must exist")
         source = self.build_script.read_text(encoding="utf-8")
