@@ -573,22 +573,22 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertNotIn("http://", source.casefold())
         self.assertNotIn("https://", source.casefold())
 
-    def test_windows_builder_resolves_executables_without_conflicting_get_command_parameters(self):
-        source = self.build_script.read_text(encoding="utf-8")
-        self.assertIn("function Resolve-ApplicationPath", source)
-        resolver = source[
-            source.index("function Resolve-ApplicationPath"):
-            source.index("function Get-ContainedPath")
-        ]
-        self.assertIn("[IO.Path]::IsPathFullyQualified", resolver)
-        self.assertIn("Get-Item -LiteralPath", resolver)
-        self.assertIn("Get-Command -Name $Name -ErrorAction Stop", resolver)
-        self.assertIn("[Management.Automation.CommandTypes]::Application", resolver)
-        self.assertNotIn("-CommandType", resolver)
-        self.assertNotRegex(source, r"Get-Command[^\r\n]+-CommandType")
-        self.assertIn("Resolve-ApplicationPath -Name $PythonExecutable", source)
-        self.assertIn("Resolve-ApplicationPath -Name 'npm.cmd'", source)
-        self.assertIn("Resolve-ApplicationPath -Name 'ISCC.exe'", source)
+    def test_windows_powershell_avoids_split_path_76_parameter_set_conflict(self):
+        workflow = (
+            Path(__file__).parents[1] / ".github" / "workflows" / "desktop-release.yml"
+        ).read_text(encoding="utf-8")
+        sources = (self.build_script.read_text(encoding="utf-8"), workflow)
+        for source in sources:
+            with self.subTest(source=source[:40]):
+                self.assertNotRegex(
+                    source,
+                    r"Split-Path\s+-LiteralPath[^\r\n]*\s+-(?:Parent|Leaf)\b",
+                )
+        self.assertIn("[IO.Path]::GetDirectoryName($PSCommandPath)", sources[0])
+        self.assertIn("[IO.Path]::GetDirectoryName($FullPath)", sources[0])
+        self.assertIn("[IO.Path]::GetFileName($FullPath)", sources[0])
+        self.assertIn("[IO.Path]::GetDirectoryName($InstallDir)", workflow)
+        self.assertIn("[IO.Path]::GetFileName($InstallDir)", workflow)
 
     def test_windows_builder_preserves_old_installer_until_verified_temporary_output_exists(self):
         self.assertTrue(self.build_script.is_file(), "Windows build wrapper must exist")

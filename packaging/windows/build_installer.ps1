@@ -20,29 +20,13 @@ function Invoke-NativeCommand {
     }
 }
 
-$ScriptDirectory = Split-Path -LiteralPath $PSCommandPath -Parent
+$ScriptDirectory = [IO.Path]::GetDirectoryName($PSCommandPath)
 $ProjectRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptDirectory '..\..')).Path
 $ProjectPrefix = $ProjectRoot.TrimEnd('\') + '\'
 if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
     $env:PYTHONPATH = $ProjectRoot
 } else {
     $env:PYTHONPATH = $ProjectRoot + [IO.Path]::PathSeparator + $env:PYTHONPATH
-}
-
-function Resolve-ApplicationPath {
-    param([Parameter(Mandatory = $true)][string]$Name)
-    if ([IO.Path]::IsPathFullyQualified($Name)) {
-        $Item = Get-Item -LiteralPath $Name -Force -ErrorAction Stop
-        if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw "Application path must be a regular non-reparse file: $Name"
-        }
-        return $Item.FullName
-    }
-    $Command = Get-Command -Name $Name -ErrorAction Stop
-    if ($Command.CommandType -ne [Management.Automation.CommandTypes]::Application) {
-        throw "Command is not an executable application: $Name"
-    }
-    return $Command.Source
 }
 
 function Get-ContainedPath {
@@ -57,8 +41,8 @@ function Get-ContainedPath {
 function Get-PathEntryNoFollow {
     param([Parameter(Mandatory = $true)][string]$Path)
     $FullPath = [IO.Path]::GetFullPath($Path)
-    $ParentPath = Split-Path -LiteralPath $FullPath -Parent
-    $LeafName = Split-Path -LiteralPath $FullPath -Leaf
+    $ParentPath = [IO.Path]::GetDirectoryName($FullPath)
+    $LeafName = [IO.Path]::GetFileName($FullPath)
     if ([string]::IsNullOrEmpty($ParentPath) -or [string]::IsNullOrEmpty($LeafName)) {
         throw "Cannot enumerate filesystem entry without a parent and leaf: $FullPath"
     }
@@ -296,12 +280,13 @@ if (-not $BrowserSourceItem.PSIsContainer -or
     throw "Browser source must be a real directory: $BrowserSourcePath"
 }
 
-$PythonPath = Resolve-ApplicationPath -Name $PythonExecutable
-$NpmPath = Resolve-ApplicationPath -Name 'npm.cmd'
+$PythonPath = (Get-Command -Name $PythonExecutable -CommandType Application -ErrorAction Stop).Source
+$NpmPath = (Get-Command -Name 'npm.cmd' -CommandType Application -ErrorAction Stop).Source
 if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
-    try {
-        $InnoCompiler = Resolve-ApplicationPath -Name 'ISCC.exe'
-    } catch [Management.Automation.CommandNotFoundException] {
+    $InnoCommand = Get-Command -Name 'ISCC.exe' -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -ne $InnoCommand) {
+        $InnoCompiler = $InnoCommand.Source
+    } else {
         $Candidates = @(
             (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
             (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
@@ -313,7 +298,7 @@ if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
 if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
     throw 'ISCC.exe was not found. Install Inno Setup 6 or set SAU_ISCC.'
 }
-$InnoCompilerPath = Resolve-ApplicationPath -Name $InnoCompiler
+$InnoCompilerPath = (Resolve-Path -LiteralPath $InnoCompiler).Path
 
 $FrontendDirectory = Get-ContainedPath 'sau_frontend'
 $FrontendDist = Get-SafeMutablePath 'sau_frontend\dist'

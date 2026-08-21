@@ -418,8 +418,8 @@ jobs:
           $ArchiveName = 'windows-installed-payload.tar'
           $Archive = Join-Path $ArtifactDirectory $ArchiveName
           $ArchiveChecksum = "$Archive.sha256"
-          $InstallParent = Split-Path -LiteralPath $InstallDir -Parent
-          $InstallLeaf = Split-Path -LiteralPath $InstallDir -Leaf
+          $InstallParent = [IO.Path]::GetDirectoryName($InstallDir)
+          $InstallLeaf = [IO.Path]::GetFileName($InstallDir)
           & tar.exe -cf $Archive -C $InstallParent $InstallLeaf
           if ($LASTEXITCODE -ne 0) { throw 'Installed Windows payload archive failed.' }
           $ArchiveHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
