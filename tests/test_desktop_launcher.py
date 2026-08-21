@@ -63,11 +63,12 @@ class DesktopLauncherTests(unittest.TestCase):
             events.append("server-start")
             return server
 
-        def open_window(url, *, server, stop_event):
+        def open_window(url, *, server, stop_event, status_callback):
             self.assertEqual(url, "http://127.0.0.1:49152/")
             self.assertNotIn("process-secret", url)
             self.assertIs(server, expected_server)
             self.assertIsInstance(stop_event, threading.Event)
+            self.assertTrue(callable(status_callback))
             events.append("window-open")
             if window_error is not None:
                 raise window_error
@@ -305,16 +306,27 @@ class DesktopLauncherTests(unittest.TestCase):
             func()
 
         webview.start.side_effect = start_webview
+        status_events: list[str] = []
         with patch("sau_desktop.importlib.import_module", return_value=webview):
             mode = sau_desktop.open_desktop_window(
                 "http://127.0.0.1:49152/",
                 server=server,
                 stop_event=stop_event,
+                status_callback=status_events.append,
             )
 
         self.assertEqual(mode, "webview")
         self.assertEqual(backend_calls, ["master"])
         window.destroy.assert_not_called()
+        self.assertEqual(status_events, [
+            "webview-imported",
+            "webview-window-created",
+            "webview-loop-starting",
+            "webview-monitor-started",
+            "webview-close-requested",
+            "webview-close-complete",
+            "webview-loop-returned",
+        ])
 
     def test_webview_close_bypasses_shown_wait_during_early_protected_quit(self):
         shown = threading.Event()

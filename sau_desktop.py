@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from werkzeug.serving import make_server
 
@@ -271,43 +271,58 @@ def open_desktop_window(
     *,
     server: LoopbackServer,
     stop_event: threading.Event,
+    status_callback: Callable[[str], None] | None = None,
 ) -> Literal["webview", "browser"]:
     """Open PyWebView, falling back to the user's default browser."""
+    def report(event: str) -> None:
+        if status_callback is not None:
+            status_callback(event)
+
     try:
         webview = importlib.import_module("webview")
+        report("webview-imported")
         window = webview.create_window(
             _WINDOW_TITLE,
             url,
             width=1200,
             height=800,
         )
+        report("webview-window-created")
         monitor_cancel = threading.Event()
 
         def monitor_server() -> None:
+            report("webview-monitor-started")
             try:
                 server.wait_until_stopped(stop_event, monitor_cancel)
             except RuntimeError:
                 pass
             if monitor_cancel.is_set():
                 return
+            report("webview-close-requested")
             try:
                 _destroy_webview_window(window)
             except Exception as error:
+                report("webview-close-failed")
                 _LOGGER.error(
                     "Desktop window close failed (%s).",
                     _exception_category(error),
                 )
+            else:
+                report("webview-close-complete")
 
         try:
             # Let PyWebView start the monitor only after it has selected and
             # initialized its native GUI backend. Starting our own thread before
             # ``webview.start`` races Windows backend creation and can leave the
             # WinForms loop alive after a protected early quit.
+            report("webview-loop-starting")
             webview.start(func=monitor_server)
+            report("webview-loop-returned")
         finally:
             monitor_cancel.set()
         return "webview"
     except Exception as error:
+        report("webview-fallback")
         _LOGGER.error(
             "Desktop window unavailable (%s); using the default browser.",
             _exception_category(error),
@@ -382,6 +397,7 @@ def main() -> None:
                 server.url,
                 server=server,
                 stop_event=stop_event,
+                status_callback=status.emit,
             )
             status.emit("window-returned", mode)
             if mode == "browser":
