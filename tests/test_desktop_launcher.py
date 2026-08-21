@@ -39,6 +39,8 @@ class DesktopLauncherTests(unittest.TestCase):
             return app
 
         api_module = SimpleNamespace(create_desktop_app=create_app)
+        expected_server = server
+        self._main_app = app
 
         def import_module(name):
             self.assertIn("browser-configure", events)
@@ -59,9 +61,11 @@ class DesktopLauncherTests(unittest.TestCase):
             events.append("server-start")
             return server
 
-        def open_window(url):
+        def open_window(url, *, server, stop_event):
             self.assertEqual(url, "http://127.0.0.1:49152/")
             self.assertNotIn("process-secret", url)
+            self.assertIs(server, expected_server)
+            self.assertIsInstance(stop_event, threading.Event)
             events.append("window-open")
             if window_error is not None:
                 raise window_error
@@ -129,7 +133,8 @@ class DesktopLauncherTests(unittest.TestCase):
         raw_server.serve_forever.side_effect = lambda: stop.wait(timeout=2)
         raw_server.shutdown.side_effect = stop.set
 
-        with patch("sau_desktop.make_server", return_value=raw_server) as make_server:
+        with patch("sau_desktop.make_server", return_value=raw_server) as make_server, \
+             patch("sau_desktop._probe_server_health", return_value=True):
             server = sau_desktop.start_loopback_server(Mock())
             self.assertEqual(server.url, "http://127.0.0.1:49152/")
             self.assertTrue(server.thread.daemon)
@@ -143,15 +148,30 @@ class DesktopLauncherTests(unittest.TestCase):
         raw_server.shutdown.assert_called_once_with()
         raw_server.server_close.assert_called_once_with()
 
+    def test_server_start_confirms_health_readiness(self):
+        stop = threading.Event()
+        raw_server = Mock(server_port=49152)
+        raw_server.serve_forever.side_effect = lambda: stop.wait(timeout=2)
+        raw_server.shutdown.side_effect = stop.set
+
+        with patch("sau_desktop.make_server", return_value=raw_server), \
+             patch("sau_desktop._probe_server_health", return_value=True) as probe:
+            server = sau_desktop.start_loopback_server(Mock())
+            server.shutdown()
+            server.server_close()
+            server.thread.join(timeout=2)
+
+        probe.assert_called_with("http://127.0.0.1:49152/api/v1/health")
+
     def test_server_thread_failure_is_observable_without_sensitive_log_text(self):
         raw_server = Mock(server_port=49152)
         raw_server.serve_forever.side_effect = RuntimeError(
             "secret-token /Users/operator/private/browser"
         )
         logger = Mock()
-        with patch("sau_desktop.make_server", return_value=raw_server), \
-             patch("sau_desktop._LOGGER", logger):
-            server = sau_desktop.start_loopback_server(Mock())
+        with patch("sau_desktop._LOGGER", logger):
+            server = sau_desktop.LoopbackServer(raw_server)
+            server.start()
             server.thread.join(timeout=2)
             with self.assertRaises(RuntimeError) as raised:
                 server.raise_if_failed()
@@ -176,9 +196,17 @@ class DesktopLauncherTests(unittest.TestCase):
 
     def test_webview_uses_requested_size(self):
         webview = Mock()
+        server = Mock()
+        server.wait_until_stopped.side_effect = (
+            lambda _stop, cancel: cancel.wait(timeout=1)
+        )
         with patch("sau_desktop.importlib.import_module", return_value=webview), \
              patch("sau_desktop.webbrowser.open") as open_browser:
-            mode = sau_desktop.open_desktop_window("http://127.0.0.1:49152/")
+            mode = sau_desktop.open_desktop_window(
+                "http://127.0.0.1:49152/",
+                server=server,
+                stop_event=threading.Event(),
+            )
 
         self.assertEqual(mode, "webview")
         webview.create_window.assert_called_once_with(
@@ -190,6 +218,104 @@ class DesktopLauncherTests(unittest.TestCase):
         webview.start.assert_called_once_with()
         open_browser.assert_not_called()
 
+    def test_live_server_failure_destroys_webview_and_is_observable(self):
+        server_ready = threading.Event()
+        crash_server = threading.Event()
+        window_destroyed = threading.Event()
+        raw_server = Mock(server_port=49152)
+
+        def serve_forever():
+            server_ready.set()
+            if not crash_server.wait(timeout=2):
+                return
+            raise RuntimeError("server crashed after readiness")
+
+        raw_server.serve_forever.side_effect = serve_forever
+        server = sau_desktop.LoopbackServer(raw_server)
+        server.start()
+        self.assertTrue(server_ready.wait(timeout=2))
+
+        window = Mock()
+        window.destroy.side_effect = window_destroyed.set
+        webview = Mock()
+        webview.create_window.return_value = window
+
+        def webview_start():
+            crash_server.set()
+            self.assertTrue(window_destroyed.wait(timeout=2))
+
+        webview.start.side_effect = webview_start
+        try:
+            with patch("sau_desktop.importlib.import_module", return_value=webview):
+                sau_desktop.open_desktop_window(
+                    server.url,
+                    server=server,
+                    stop_event=threading.Event(),
+                )
+            server.thread.join(timeout=2)
+            window.destroy.assert_called_once_with()
+            with self.assertRaisesRegex(RuntimeError, "RuntimeError"):
+                server.raise_if_failed()
+        finally:
+            crash_server.set()
+            server.thread.join(timeout=2)
+            server.server_close()
+
+    def test_main_propagates_webview_server_failure_after_full_cleanup(self):
+        server_ready = threading.Event()
+        crash_server = threading.Event()
+        window_destroyed = threading.Event()
+        raw_server = Mock(server_port=49152)
+
+        def serve_forever():
+            server_ready.set()
+            crash_server.wait(timeout=2)
+            raise RuntimeError("post-readiness failure")
+
+        raw_server.serve_forever.side_effect = serve_forever
+        server = sau_desktop.LoopbackServer(raw_server)
+        server.start()
+        self.assertTrue(server_ready.wait(timeout=2))
+
+        events = []
+        jobs = Mock()
+        jobs.shutdown.side_effect = lambda: events.append("jobs-shutdown")
+        app_shutdown = Mock(side_effect=lambda: events.append("app-shutdown"))
+        app = SimpleNamespace(extensions={"sau_desktop_shutdown": app_shutdown})
+        service = SimpleNamespace(JobManager=Mock(return_value=jobs))
+        api = SimpleNamespace(create_desktop_app=Mock(return_value=app))
+        window = Mock()
+        window.destroy.side_effect = window_destroyed.set
+        webview = Mock()
+        webview.create_window.return_value = window
+
+        def start_webview():
+            crash_server.set()
+            self.assertTrue(window_destroyed.wait(timeout=2))
+
+        webview.start.side_effect = start_webview
+        modules = {
+            "sau_desktop_service": service,
+            "sau_desktop_api": api,
+            "webview": webview,
+        }
+        try:
+            with patch("sau_desktop.get_runtime_paths", return_value=Mock()), \
+                 patch("sau_desktop.configure_browser_environment"), \
+                 patch("sau_desktop.secrets.token_urlsafe", return_value="secret"), \
+                 patch("sau_desktop.start_loopback_server", return_value=server), \
+                 patch("sau_desktop.webbrowser.open"), \
+                 patch("sau_desktop.importlib.import_module", side_effect=modules.__getitem__):
+                with self.assertRaisesRegex(RuntimeError, "RuntimeError"):
+                    sau_desktop.main()
+        finally:
+            crash_server.set()
+            server.thread.join(timeout=2)
+            server.server_close()
+
+        window.destroy.assert_called_once_with()
+        self.assertEqual(events, ["app-shutdown", "jobs-shutdown"])
+
     def test_webview_failure_falls_back_without_logging_sensitive_reason(self):
         logger = Mock()
         with patch("sau_desktop.webbrowser.open") as open_browser, \
@@ -198,7 +324,11 @@ class DesktopLauncherTests(unittest.TestCase):
                  "sau_desktop.importlib.import_module",
                  side_effect=RuntimeError("token /Users/operator/private"),
              ):
-            mode = sau_desktop.open_desktop_window("http://127.0.0.1:49152/")
+            mode = sau_desktop.open_desktop_window(
+                "http://127.0.0.1:49152/",
+                server=Mock(),
+                stop_event=threading.Event(),
+            )
 
         self.assertEqual(mode, "browser")
         open_browser.assert_called_once_with("http://127.0.0.1:49152/")
@@ -211,12 +341,17 @@ class DesktopLauncherTests(unittest.TestCase):
         events, _paths, _jobs, _app_shutdown, server, patches = self._main_dependencies(
             window_result="browser"
         )
-        server.wait_until_stopped.side_effect = lambda: events.append("browser-wait")
+        def stop_from_gui(stop_event):
+            self._main_app.extensions["sau_desktop_stop"]()
+            self.assertTrue(stop_event.is_set())
+            events.append("browser-wait")
+
+        server.wait_until_stopped.side_effect = stop_from_gui
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             sau_desktop.main()
 
         self.assertLess(events.index("browser-wait"), events.index("server-shutdown"))
-        server.wait_until_stopped.assert_called_once_with()
+        server.wait_until_stopped.assert_called_once_with(unittest.mock.ANY)
 
     def test_shutdown_order_runs_all_hooks_on_keyboard_interrupt(self):
         events, _paths, jobs, app_shutdown, server, patches = self._main_dependencies(

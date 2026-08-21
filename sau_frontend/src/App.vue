@@ -46,7 +46,16 @@
               <el-icon class="toggle-sidebar" @click="toggleSidebar"><Fold /></el-icon>
             </div>
             <div class="header-right">
-              <!-- 账号信息已移除 -->
+              <el-button
+                type="danger"
+                plain
+                :loading="quitting"
+                :disabled="quitting"
+                @click="quitApplication"
+              >
+                <el-icon><SwitchButton /></el-icon>
+                退出应用
+              </el-button>
             </div>
           </div>
         </el-header>
@@ -64,9 +73,11 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { http } from '@/utils/request'
 import {
   HomeFilled, User, DataAnalysis,
-  Fold, Picture, Upload
+  Fold, Picture, Upload, SwitchButton
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -78,10 +89,35 @@ const activeMenu = computed(() => {
 
 // 侧边栏折叠状态
 const isCollapse = ref(false)
+const quitting = ref(false)
 
 // 切换侧边栏折叠状态
 const toggleSidebar = () => {
   isCollapse.value = !isCollapse.value
+}
+
+const quitApplication = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '退出应用会停止本机服务，正在执行的登录或发布任务也会结束。是否继续？',
+      '确认退出应用',
+      {
+        confirmButtonText: '停止本机服务并退出',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+  } catch {
+    return
+  }
+
+  quitting.value = true
+  try {
+    await http.post('/api/v1/app/quit')
+    ElMessage.success('本机服务正在停止')
+  } catch {
+    quitting.value = false
+  }
 }
 </script>
 
@@ -174,20 +210,11 @@ const toggleSidebar = () => {
     }
     
     .header-right {
-      .user-dropdown {
-        display: flex;
-        align-items: center;
-        cursor: pointer;
-        
-        .username {
-          margin: 0 8px;
-          color: $text-regular;
-        }
-        
-        .el-icon {
-          font-size: 12px;
-          color: $text-secondary;
-        }
+      display: flex;
+      align-items: center;
+
+      .el-icon {
+        margin-right: 6px;
       }
     }
   }

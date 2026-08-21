@@ -204,6 +204,95 @@ class DesktopApiTests(unittest.TestCase):
             app_source,
         )
         self.assertIn('role="alert"', app_source)
+        self.assertIn("退出应用", app_source)
+        self.assertIn("停止本机服务", app_source)
+        self.assertIn("ElMessageBox.confirm", app_source)
+        self.assertIn("http.post('/api/v1/app/quit'", app_source)
+        self.assertNotIn("session_token", app_source)
+
+    def test_quit_endpoint_requires_private_mutation_and_launcher_callback(self):
+        stop = Mock()
+        self.app.extensions["sau_desktop_stop"] = stop
+        headers = self._authorize()
+
+        missing_cookie = self.app.test_client().post(
+            "/api/v1/app/quit",
+            headers={"Origin": "http://127.0.0.1"},
+        )
+        cross_origin = self.client.post(
+            "/api/v1/app/quit",
+            headers={"Origin": "https://attacker.example"},
+        )
+        get_response = self.client.get("/api/v1/app/quit")
+        accepted = self.client.post("/api/v1/app/quit", headers=headers)
+
+        self.assertEqual(missing_cookie.status_code, 403)
+        self.assertEqual(cross_origin.status_code, 403)
+        self.assertEqual(get_response.status_code, 405)
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(accepted.get_json()["data"], {"stopping": True})
+        stop.assert_called_once_with()
+
+    def test_quit_endpoint_without_launcher_callback_is_unavailable(self):
+        response = self.client.post(
+            "/api/v1/app/quit",
+            headers=self._authorize(),
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"]["code"], "unavailable")
+
+    def test_source_frontend_dist_is_used_when_packaged_frontend_is_absent(self):
+        resource_root = Path(self.temp.name) / "source-resources"
+        source_dist = resource_root / "sau_frontend" / "dist"
+        (source_dist / "assets").mkdir(parents=True)
+        (source_dist / "index.html").write_text("SOURCE-INDEX", encoding="utf-8")
+        (source_dist / "assets" / "app.js").write_text("SOURCE-ASSET", encoding="utf-8")
+        paths = RuntimePaths(
+            resource_root=resource_root,
+            data_root=self.paths.data_root,
+            cookies_dir=self.paths.cookies_dir,
+            profiles_dir=self.paths.profiles_dir,
+            logs_dir=self.paths.logs_dir,
+            safety_dir=self.paths.safety_dir,
+            media_dir=self.paths.media_dir,
+            database_file=self.paths.database_file,
+        )
+        app = create_desktop_app(paths=paths, session_token="secret", jobs=self.jobs)
+        app.config["SERVER_NAME"] = "127.0.0.1"
+        client = app.test_client()
+
+        index = client.get("/")
+        asset = client.get("/assets/app.js")
+        try:
+            self.assertIn(b"SOURCE-INDEX", index.data)
+            self.assertIn(b"SOURCE-ASSET", asset.data)
+        finally:
+            index.close()
+            asset.close()
+
+    def test_source_frontend_directory_symlink_cannot_escape_resource_root(self):
+        resource_root = Path(self.temp.name) / "source-symlink-resources"
+        resource_root.mkdir()
+        outside = Path(self.temp.name) / "outside-dist"
+        outside.mkdir()
+        (outside / "index.html").write_text("OUTSIDE", encoding="utf-8")
+        source_parent = resource_root / "sau_frontend"
+        source_parent.mkdir()
+        (source_parent / "dist").symlink_to(outside, target_is_directory=True)
+        paths = RuntimePaths(
+            resource_root=resource_root,
+            data_root=self.paths.data_root,
+            cookies_dir=self.paths.cookies_dir,
+            profiles_dir=self.paths.profiles_dir,
+            logs_dir=self.paths.logs_dir,
+            safety_dir=self.paths.safety_dir,
+            media_dir=self.paths.media_dir,
+            database_file=self.paths.database_file,
+        )
+
+        with self.assertRaisesRegex(ValueError, "frontend"):
+            create_desktop_app(paths=paths, session_token="secret", jobs=self.jobs)
 
     def test_frontend_runtime_helpers_and_polling_requests_are_explicit(self):
         publish_source = Path(
@@ -271,6 +360,7 @@ class DesktopApiTests(unittest.TestCase):
         self.assertIn("HttpOnly", header)
         self.assertIn("SameSite=Strict", header)
         self.assertIn("Path=/", header)
+        response.close()
 
     def test_untrusted_host_cannot_receive_cookie_or_forge_mutation(self):
         attacker = self.app.test_client()
@@ -308,6 +398,7 @@ class DesktopApiTests(unittest.TestCase):
 
         self.assertEqual(index.status_code, 200)
         self.assertEqual(mutation.status_code, 202)
+        index.close()
 
     def test_origin_port_must_match_validated_loopback_host(self):
         client = self.app.test_client()
@@ -834,6 +925,8 @@ class DesktopApiTests(unittest.TestCase):
         self.assertNotIn(b"INDEX-SECRET", index.data)
         self.assertNotIn(b"ASSET-SECRET", asset.data)
         self.assertEqual(asset.status_code, 404)
+        index.close()
+        asset.close()
 
     def test_material_contract_uploads_lists_and_publishes_by_opaque_id(self):
         client = self.client

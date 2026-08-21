@@ -658,11 +658,32 @@ def create_desktop_app(
     _prepare_runtime_paths(paths)
     _initialize_database(paths)
     resource_root = Path(paths.resource_root).expanduser().resolve()
-    frontend_dir = (resource_root / "frontend").resolve()
-    try:
-        frontend_dir.relative_to(resource_root)
-    except ValueError as exc:
-        raise ValueError("frontend must stay inside resource root") from exc
+
+    def contained_frontend_root(relative: Path) -> Path:
+        candidate = (resource_root / relative).resolve()
+        try:
+            candidate.relative_to(resource_root)
+        except ValueError as exc:
+            raise ValueError("frontend must stay inside resource root") from exc
+        return candidate
+
+    packaged_frontend = contained_frontend_root(Path("frontend"))
+    source_frontend = contained_frontend_root(Path("sau_frontend") / "dist")
+
+    def has_contained_index(root: Path) -> bool:
+        index_file = (root / "index.html").resolve()
+        try:
+            index_file.relative_to(root)
+        except ValueError:
+            return False
+        return index_file.is_file()
+
+    if has_contained_index(packaged_frontend):
+        frontend_dir = packaged_frontend
+    elif has_contained_index(source_frontend):
+        frontend_dir = source_frontend
+    else:
+        frontend_dir = packaged_frontend
     login_jobs = _LoginJobManager(
         paths=paths,
         parser_factory=parser_factory,
@@ -743,6 +764,27 @@ def create_desktop_app(
     @app.get("/api/v1/health")
     def health():
         return _success({"status": "ok"})
+
+    @app.route("/api/v1/app/quit", methods=["GET", "HEAD", "POST"])
+    def quit_application():
+        if request.method != "POST":
+            return _failure("method_not_allowed", "API method not allowed.", 405)
+        stop_callback = app.extensions.get("sau_desktop_stop")
+        if not callable(stop_callback):
+            return _failure(
+                "unavailable",
+                "Application shutdown is unavailable in this runtime.",
+                503,
+            )
+        try:
+            stop_callback()
+        except Exception:
+            return _failure(
+                "internal_error",
+                "Unable to stop the local application.",
+                500,
+            )
+        return _success({"stopping": True}, 202)
 
     @app.post("/api/v1/materials")
     def upload_material():

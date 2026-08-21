@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import secrets
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 import webbrowser
 from typing import Any, Literal
 
@@ -19,6 +23,7 @@ from sau_runtime import get_runtime_paths
 _LOGGER = logging.getLogger(__name__)
 _LOOPBACK_HOST = "127.0.0.1"
 _WINDOW_TITLE = "Social Auto Upload"
+_SERVER_READY_TIMEOUT_SECONDS = 5.0
 
 
 def _exception_category(error: BaseException) -> str:
@@ -28,12 +33,33 @@ def _exception_category(error: BaseException) -> str:
     return name[:64]
 
 
+def _probe_server_health(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=0.25) as response:
+            if response.status != 200:
+                return False
+            body = response.read(4096)
+    except (OSError, urllib.error.URLError):
+        return False
+    try:
+        envelope = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(envelope, dict)
+        and envelope.get("ok") is True
+        and isinstance(envelope.get("data"), dict)
+        and envelope["data"].get("status") == "ok"
+    )
+
+
 class LoopbackServer:
     """Own a Werkzeug server, its daemon thread, and deterministic cleanup."""
 
     def __init__(self, server: Any) -> None:
         self._server = server
         self.url = f"http://{_LOOPBACK_HOST}:{int(server.server_port)}/"
+        self.health_url = f"{self.url}api/v1/health"
         self._failure: BaseException | None = None
         self._stopped = threading.Event()
         self._cleanup_lock = threading.Lock()
@@ -71,9 +97,31 @@ class LoopbackServer:
                 f"Local desktop server stopped unexpectedly ({category})."
             ) from None
 
-    def wait_until_stopped(self) -> None:
-        """Keep browser-fallback source mode alive until stop or Ctrl+C."""
-        while not self._stopped.wait(timeout=0.25):
+    def wait_until_ready(self, timeout: float = _SERVER_READY_TIMEOUT_SECONDS) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._stopped.is_set():
+                self.raise_if_failed()
+                raise RuntimeError("Local desktop server stopped before it was ready.")
+            if _probe_server_health(self.health_url):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Local desktop server health check timed out.")
+            self._stopped.wait(timeout=0.05)
+
+    def wait_until_stopped(
+        self,
+        stop_event: threading.Event | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Wait for server failure, application stop, cancellation, or Ctrl+C."""
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if self._stopped.wait(timeout=0.05):
+                break
             self.raise_if_failed()
         self.raise_if_failed()
 
@@ -97,21 +145,59 @@ def start_loopback_server(app: Any) -> LoopbackServer:
     """Bind the desktop API to a literal loopback address and OS-selected port."""
     raw_server = make_server(_LOOPBACK_HOST, 0, app, threaded=True)
     server = LoopbackServer(raw_server)
-    server.start()
+    try:
+        server.start()
+        server.wait_until_ready()
+    except BaseException:
+        server.shutdown()
+        server.server_close()
+        raise
     return server
 
 
-def open_desktop_window(url: str) -> Literal["webview", "browser"]:
+def open_desktop_window(
+    url: str,
+    *,
+    server: LoopbackServer,
+    stop_event: threading.Event,
+) -> Literal["webview", "browser"]:
     """Open PyWebView, falling back to the user's default browser."""
     try:
         webview = importlib.import_module("webview")
-        webview.create_window(
+        window = webview.create_window(
             _WINDOW_TITLE,
             url,
             width=1200,
             height=800,
         )
-        webview.start()
+        monitor_cancel = threading.Event()
+
+        def monitor_server() -> None:
+            try:
+                server.wait_until_stopped(stop_event, monitor_cancel)
+            except RuntimeError:
+                pass
+            if monitor_cancel.is_set():
+                return
+            try:
+                window.destroy()
+            except Exception as error:
+                _LOGGER.error(
+                    "Desktop window close failed (%s).",
+                    _exception_category(error),
+                )
+
+        monitor = threading.Thread(
+            target=monitor_server,
+            name="sau-webview-monitor",
+            daemon=True,
+        )
+        monitor.start()
+        try:
+            webview.start()
+        finally:
+            monitor_cancel.set()
+            monitor.join(timeout=1.0)
         return "webview"
     except Exception as error:
         _LOGGER.error(
@@ -152,6 +238,7 @@ def main() -> None:
     jobs = None
     app = None
     server = None
+    stop_event = threading.Event()
     try:
         paths = get_runtime_paths()
         configure_browser_environment(
@@ -170,12 +257,19 @@ def main() -> None:
             session_token=secrets.token_urlsafe(32),
             jobs=jobs,
         )
+        app.extensions["sau_desktop_stop"] = stop_event.set
         server = start_loopback_server(app)
-        mode = open_desktop_window(server.url)
+        mode = open_desktop_window(
+            server.url,
+            server=server,
+            stop_event=stop_event,
+        )
         if mode == "browser":
-            server.wait_until_stopped()
+            server.wait_until_stopped(stop_event)
     finally:
         _shutdown_components(server, app, jobs)
+        if server is not None:
+            server.raise_if_failed()
 
 
 if __name__ == "__main__":
