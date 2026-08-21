@@ -41,10 +41,24 @@ function Get-ContainedPath {
 function Get-PathEntryNoFollow {
     param([Parameter(Mandatory = $true)][string]$Path)
     $FullPath = [IO.Path]::GetFullPath($Path)
+    if ([string]::Equals($FullPath, $ProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return Get-Item -LiteralPath $ProjectRoot -Force -ErrorAction Stop
+    }
+    if (-not $FullPath.StartsWith($ProjectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cannot enumerate a path outside the repository: $FullPath"
+    }
     $ParentPath = [IO.Path]::GetDirectoryName($FullPath)
     $LeafName = [IO.Path]::GetFileName($FullPath)
     if ([string]::IsNullOrEmpty($ParentPath) -or [string]::IsNullOrEmpty($LeafName)) {
         throw "Cannot enumerate filesystem entry without a parent and leaf: $FullPath"
+    }
+    $ParentEntry = Get-PathEntryNoFollow -Path $ParentPath
+    if ($null -eq $ParentEntry) {
+        return $null
+    }
+    if (-not $ParentEntry.PSIsContainer -or
+        ($ParentEntry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Cannot enumerate through a non-directory or reparse point: $ParentPath"
     }
     $Matches = @(
         Get-ChildItem -LiteralPath $ParentPath -Force -ErrorAction Stop |

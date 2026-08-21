@@ -716,6 +716,12 @@ class WindowsPackagingTests(unittest.TestCase):
         helper = source[helper_start:helper_end]
         self.assertIn("Get-ChildItem -LiteralPath $ParentPath -Force", helper)
         self.assertNotIn("Test-Path", helper)
+        self.assertIn("[string]::Equals($FullPath, $ProjectRoot", helper)
+        self.assertIn("$ParentEntry = Get-PathEntryNoFollow -Path $ParentPath", helper)
+        self.assertIn("if ($null -eq $ParentEntry)", helper)
+        self.assertIn("return $null", helper)
+        self.assertIn("-not $ParentEntry.PSIsContainer", helper)
+        self.assertIn("$ParentEntry.Attributes -band [IO.FileAttributes]::ReparsePoint", helper)
         public_start = source.index("function Assert-PublicArtifactState")
         public_end = source.index("function Publish-ArtifactPair", public_start)
         public_helper = source[public_start:public_end]
