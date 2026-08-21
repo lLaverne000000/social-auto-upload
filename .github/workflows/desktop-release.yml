@@ -369,7 +369,10 @@ jobs:
             $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
             Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
-            if (-not $Process.WaitForExit(15000)) { throw 'Frozen GUI did not exit after protected quit.' }
+            if (-not $Process.WaitForExit(15000)) {
+              $Status = Get-Content -LiteralPath $StatusFile -Raw -ErrorAction SilentlyContinue
+              throw "Frozen GUI did not exit after protected quit. Status: $Status"
+            }
             if ($Process.ExitCode -ne 0) { throw "Frozen GUI exited $($Process.ExitCode)." }
           } finally {
             $env:SAU_DESKTOP_STATUS_FILE = $null
@@ -444,7 +447,10 @@ jobs:
             $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
             Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
-            if (-not $Process.WaitForExit(15000)) { throw 'Installed GUI did not exit after protected quit.' }
+            if (-not $Process.WaitForExit(15000)) {
+              $Status = Get-Content -LiteralPath $StatusFile -Raw -ErrorAction SilentlyContinue
+              throw "Installed GUI did not exit after protected quit. Status: $Status"
+            }
             if ($Process.ExitCode -ne 0) { throw "Installed GUI exited $($Process.ExitCode)." }
           } finally {
             $env:SAU_DESKTOP_STATUS_FILE = $null

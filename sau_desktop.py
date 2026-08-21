@@ -217,6 +217,55 @@ def start_loopback_server(app: Any) -> LoopbackServer:
     return server
 
 
+def _destroy_webview_window(window: Any, *, timeout: float = 5.0) -> None:
+    """Close even when an early quit arrives before PyWebView's shown event.
+
+    PyWebView 5.4 decorates ``Window.destroy`` with a 20-second wait for the
+    shown event. Windows service-backed CI can initialize WinForms without ever
+    emitting that event, so use the already initialized backend directly until
+    the closed event confirms completion.
+    """
+    events = getattr(window, "events", None)
+    shown = getattr(events, "shown", None)
+    closed = getattr(events, "closed", None)
+    if not all(
+        callable(getattr(event, method, None))
+        for event, method in ((shown, "is_set"), (closed, "is_set"), (closed, "wait"))
+    ):
+        window.destroy()
+        return
+    shown_state = shown.is_set()
+    closed_state = closed.is_set()
+    if type(shown_state) is not bool or type(closed_state) is not bool:
+        window.destroy()
+        return
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if closed_state:
+            return
+        if shown_state:
+            window.destroy()
+            return
+
+        gui = getattr(window, "gui", None)
+        destroy_window = getattr(gui, "destroy_window", None)
+        uid = getattr(window, "uid", None)
+        if callable(destroy_window) and isinstance(uid, str) and uid:
+            try:
+                destroy_window(uid)
+            except Exception:
+                pass
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Desktop window did not close after protected quit.")
+        if closed.wait(timeout=min(0.05, remaining)):
+            return
+        shown_state = shown.is_set()
+        closed_state = closed.is_set()
+
+
 def open_desktop_window(
     url: str,
     *,
@@ -242,7 +291,7 @@ def open_desktop_window(
             if monitor_cancel.is_set():
                 return
             try:
-                window.destroy()
+                _destroy_webview_window(window)
             except Exception as error:
                 _LOGGER.error(
                     "Desktop window close failed (%s).",
@@ -337,6 +386,7 @@ def main() -> None:
                 server=server,
                 stop_event=stop_event,
             )
+            status.emit("window-returned", mode)
             if mode == "browser":
                 server.wait_until_stopped(stop_event)
         finally:

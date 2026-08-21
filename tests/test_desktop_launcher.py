@@ -143,6 +143,7 @@ class DesktopLauncherTests(unittest.TestCase):
                 "app-ready",
                 "server-starting",
                 "server-ready http://127.0.0.1:49152/",
+                "window-returned webview",
                 "stopped",
             ])
             self.assertNotIn("process-secret", status_file.read_text(encoding="utf-8"))
@@ -275,6 +276,30 @@ class DesktopLauncherTests(unittest.TestCase):
         )
         webview.start.assert_called_once_with()
         open_browser.assert_not_called()
+
+    def test_webview_close_bypasses_shown_wait_during_early_protected_quit(self):
+        shown = threading.Event()
+        closed = threading.Event()
+        backend_calls: list[str] = []
+
+        class Backend:
+            def destroy_window(self, uid):
+                backend_calls.append(uid)
+                if len(backend_calls) >= 2:
+                    closed.set()
+
+        window = SimpleNamespace(
+            uid="master",
+            gui=Backend(),
+            events=SimpleNamespace(shown=shown, closed=closed),
+            destroy=Mock(side_effect=AssertionError("public destroy waits for shown")),
+        )
+
+        sau_desktop._destroy_webview_window(window, timeout=0.5)
+
+        self.assertGreaterEqual(len(backend_calls), 2)
+        self.assertEqual(set(backend_calls), {"master"})
+        window.destroy.assert_not_called()
 
     def test_live_server_failure_destroys_webview_and_is_observable(self):
         server_ready = threading.Event()
