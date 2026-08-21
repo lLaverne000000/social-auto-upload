@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+case "$(uname -m)" in
+    x86_64)
+        payload_arch="x86_64"
+        ;;
+    arm64)
+        payload_arch="arm64"
+        ;;
+    *)
+        printf 'Social Auto Upload: unsupported macOS architecture: %s\n' "$(uname -m)" >&2
+        exit 64
+        ;;
+esac
+
+launcher_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd -P)
+case "${0##*/}" in
+    sau)
+        entrypoint="sau"
+        ;;
+    *)
+        entrypoint="SocialAutoUpload"
+        ;;
+esac
+
+executable="${launcher_dir}/../Resources/payloads/${payload_arch}/${entrypoint}"
+if [ ! -x "$executable" ]; then
+    printf 'Social Auto Upload: native %s entry point is missing or not executable: %s\n' \
+        "$payload_arch" "$executable" >&2
+    exit 66
+fi
+
+exec "$executable" "$@"

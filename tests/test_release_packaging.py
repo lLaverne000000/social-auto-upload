@@ -1,9 +1,12 @@
 import hashlib
 import json
 import os
+import plistlib
 import runpy
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import types
@@ -22,18 +25,23 @@ def _write_macho(path: Path, cpu_type: int = 0x01000007) -> None:
     path.chmod(0o755)
 
 
-def _make_release_payload(root: Path) -> Path:
+def _make_release_payload(
+    root: Path,
+    *,
+    cpu_type: int = 0x01000007,
+    arch: str = "x86_64",
+) -> Path:
     (root / "frontend").mkdir(parents=True)
     (root / "frontend" / "index.html").write_text("<!doctype html>", encoding="utf-8")
     executable = root / "browsers" / "chromium" / "Chrome.app" / "Contents" / "MacOS" / "Chrome"
-    _write_macho(executable)
+    _write_macho(executable, cpu_type=cpu_type)
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     (root / "browser-manifest.json").write_text(
         json.dumps(
             {
                 "revision": "1208",
                 "payloads": {
-                    "darwin-x86_64": {
+                    f"darwin-{arch}": {
                         "executable": executable.relative_to(root).as_posix(),
                         "sha256": digest,
                     }
@@ -42,8 +50,8 @@ def _make_release_payload(root: Path) -> Path:
         ),
         encoding="utf-8",
     )
-    _write_macho(root / "sau")
-    _write_macho(root / "SocialAutoUpload")
+    _write_macho(root / "sau", cpu_type=cpu_type)
+    _write_macho(root / "SocialAutoUpload", cpu_type=cpu_type)
     return executable
 
 
@@ -459,6 +467,198 @@ class ReleaseVerificationTests(unittest.TestCase):
             (root / "conf.py").write_text('LOCAL_CHROME_PATH="/Users/me/Chrome"\n', encoding="utf-8")
             with self.assertRaises(ReleaseVerificationError):
                 verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+
+class MacOSPackagingTests(unittest.TestCase):
+    launcher_source = Path(__file__).parents[1] / "packaging" / "macos" / "launcher"
+    build_script = Path(__file__).parents[1] / "packaging" / "macos" / "build_pkg.sh"
+
+    def _make_launcher_fixture(self, root: Path) -> Path:
+        self.assertTrue(self.launcher_source.is_file(), "macOS launcher must exist")
+        macos = root / "App With Spaces.app" / "Contents" / "MacOS"
+        payloads = root / "App With Spaces.app" / "Contents" / "Resources" / "payloads"
+        macos.mkdir(parents=True)
+        for arch in ("x86_64", "arm64"):
+            payload = payloads / arch
+            payload.mkdir(parents=True)
+            for name, label in (("SocialAutoUpload", "gui"), ("sau", "cli")):
+                executable = payload / name
+                executable.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' '{label}-{arch}'\n"
+                    "printf '%s\\n' \"$@\"\n",
+                    encoding="utf-8",
+                )
+                executable.chmod(0o755)
+        shutil.copy2(self.launcher_source, macos / "launcher")
+        shutil.copy2(self.launcher_source, macos / "sau")
+        return macos
+
+    def _launcher_environment(self, root: Path, machine: str) -> dict[str, str]:
+        tools = root / f"tools-{machine}"
+        tools.mkdir(exist_ok=True)
+        uname = tools / "uname"
+        uname.write_text(f"#!/bin/sh\nprintf '%s\\n' '{machine}'\n", encoding="utf-8")
+        uname.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{tools}:/usr/bin:/bin"
+        return environment
+
+    def _make_native_payloads(self, root: Path) -> tuple[Path, Path]:
+        x86 = root / "payload x86_64"
+        arm = root / "payload arm64"
+        _make_release_payload(x86)
+        _make_release_payload(arm, cpu_type=0x0100000C, arch="arm64")
+        return x86, arm
+
+    def test_macos_launcher_selects_exact_gui_and_cli_payload_for_runtime_arch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            macos = self._make_launcher_fixture(root)
+            for machine in ("x86_64", "arm64"):
+                for entrypoint, label in (("launcher", "gui"), ("sau", "cli")):
+                    with self.subTest(machine=machine, entrypoint=entrypoint):
+                        result = subprocess.run(
+                            [str(macos / entrypoint), "argument with spaces"],
+                            text=True,
+                            capture_output=True,
+                            env=self._launcher_environment(root, machine),
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.splitlines(), [f"{label}-{machine}", "argument with spaces"])
+
+    def test_macos_launcher_rejects_unknown_architecture_without_running_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            macos = self._make_launcher_fixture(root)
+            result = subprocess.run(
+                [str(macos / "launcher")],
+                text=True,
+                capture_output=True,
+                env=self._launcher_environment(root, "riscv64"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsupported", result.stderr.casefold())
+            self.assertEqual(result.stdout, "")
+
+    def test_macos_launcher_does_not_use_eval_or_arch_translation(self):
+        self.assertTrue(self.launcher_source.is_file(), "macOS launcher must exist")
+        source = self.launcher_source.read_text(encoding="utf-8")
+        self.assertNotIn("eval ", source)
+        self.assertNotIn("arch -x86_64", source)
+        self.assertNotIn("arch -arm64", source)
+
+    def test_macos_package_requires_both_payloads(self):
+        self.assertTrue(self.build_script.is_file(), "macOS package builder must exist")
+        result = subprocess.run(
+            ["bash", str(self.build_script), "--check-inputs", "/missing/x86_64", "/missing/arm64"],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "SAU_PYTHON": sys.executable},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("both", result.stderr.casefold())
+
+    def test_macos_package_reverifies_both_declared_native_architectures(self):
+        self.assertTrue(self.build_script.is_file(), "macOS package builder must exist")
+        with tempfile.TemporaryDirectory() as tmp:
+            x86, arm = self._make_native_payloads(Path(tmp))
+            result = subprocess.run(
+                ["bash", str(self.build_script), "--check-inputs", str(x86), str(arm)],
+                text=True,
+                capture_output=True,
+                env={**os.environ, "SAU_PYTHON": sys.executable},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("both", result.stdout.casefold())
+            self.assertEqual(json.loads((x86 / "release-manifest.json").read_text())["arch"], "x86_64")
+            self.assertEqual(json.loads((arm / "release-manifest.json").read_text())["arch"], "arm64")
+
+    def test_macos_package_rejects_payloads_in_swapped_architecture_slots(self):
+        self.assertTrue(self.build_script.is_file(), "macOS package builder must exist")
+        with tempfile.TemporaryDirectory() as tmp:
+            x86, arm = self._make_native_payloads(Path(tmp))
+            result = subprocess.run(
+                ["bash", str(self.build_script), "--check-inputs", str(arm), str(x86)],
+                text=True,
+                capture_output=True,
+                env={**os.environ, "SAU_PYTHON": sys.executable},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("architecture", result.stderr.casefold())
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and shutil.which("pkgbuild")
+        and shutil.which("productbuild")
+        and shutil.which("pkgutil"),
+        "native macOS package inspection requires pkgbuild/productbuild/pkgutil",
+    )
+    def test_macos_package_contains_fixed_app_layout_and_conditional_cli_install(self):
+        self.assertTrue(self.build_script.is_file(), "macOS package builder must exist")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            x86, arm = self._make_native_payloads(root)
+            output = root / "release with spaces"
+            result = subprocess.run(
+                ["bash", str(self.build_script), str(x86), str(arm), str(output)],
+                text=True,
+                capture_output=True,
+                env={**os.environ, "SAU_PYTHON": sys.executable},
+                preexec_fn=lambda: os.umask(0o077),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            package = output / "SocialAutoUpload-macOS-Universal.pkg"
+            self.assertTrue(package.is_file())
+            self.assertEqual([item.name for item in output.iterdir()], [package.name])
+
+            expanded = root / "expanded"
+            inspect_result = subprocess.run(
+                ["pkgutil", "--expand-full", str(package), str(expanded)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(inspect_result.returncode, 0, inspect_result.stderr)
+            apps = list(expanded.rglob("Social Auto Upload.app"))
+            self.assertEqual(len(apps), 1)
+            app = apps[0]
+            self.assertEqual(app.stat().st_mode & 0o777, 0o755)
+            self.assertTrue((app / "Contents/MacOS/launcher").is_file())
+            self.assertTrue((app / "Contents/MacOS/sau").is_file())
+            self.assertTrue((app / "Contents/Resources/payloads/x86_64/SocialAutoUpload").is_file())
+            self.assertTrue((app / "Contents/Resources/payloads/arm64/SocialAutoUpload").is_file())
+            info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+            self.assertEqual((app / "Contents/Info.plist").stat().st_mode & 0o777, 0o644)
+            self.assertEqual(info["CFBundleExecutable"], "launcher")
+            self.assertEqual(info["CFBundleIdentifier"], "com.socialautoupload.desktop")
+
+            postinstalls = list(expanded.rglob("postinstall"))
+            self.assertEqual(len(postinstalls), 1)
+            postinstall = postinstalls[0]
+            without_bin = root / "target without bin"
+            without_bin.mkdir()
+            no_bin_result = subprocess.run(
+                [str(postinstall), "package", "1.0", str(without_bin)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(no_bin_result.returncode, 0, no_bin_result.stderr)
+            self.assertFalse((without_bin / "usr").exists())
+
+            with_bin = root / "target with bin"
+            (with_bin / "usr/local/bin").mkdir(parents=True)
+            cli_result = subprocess.run(
+                [str(postinstall), "package", "1.0", str(with_bin)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(cli_result.returncode, 0, cli_result.stderr)
+            installed_cli = with_bin / "usr/local/bin/sau"
+            self.assertTrue(installed_cli.is_symlink())
+            self.assertEqual(
+                os.readlink(installed_cli),
+                "/Applications/Social Auto Upload.app/Contents/MacOS/sau",
+            )
 
 
 if __name__ == "__main__":
