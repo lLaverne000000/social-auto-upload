@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import runpy
+import socket
 import struct
 import sys
 import tempfile
@@ -41,10 +42,83 @@ def _make_release_payload(root: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    _write_macho(root / "sau")
+    _write_macho(root / "SocialAutoUpload")
     return executable
 
 
+def _make_browser_source(root: Path) -> Path:
+    source = root / "chromium-1208"
+    _write_macho(source / "Chrome.app" / "Contents" / "MacOS" / "Chrome")
+    return source
+
+
+def _safe_conf_text() -> str:
+    return (
+        "from sau_runtime import get_runtime_paths\n\n"
+        "_RUNTIME_PATHS = get_runtime_paths()\n"
+        "BASE_DIR = _RUNTIME_PATHS.data_root\n"
+        "RESOURCE_DIR = _RUNTIME_PATHS.resource_root\n\n"
+        'XHS_SERVER = "http://127.0.0.1:11901"\n'
+        'LOCAL_CHROME_PATH = ""\n'
+        "LOCAL_CHROME_HEADLESS = True\n"
+        "DEBUG_MODE = True\n"
+        "YT_PROXY = None\n"
+    )
+
+
+def _bind_unix_socket(path: Path) -> socket.socket:
+    handle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    handle.bind(str(path))
+    return handle
+
+
 class BrowserStagingTests(unittest.TestCase):
+    def test_rejects_secret_names_and_private_key_material(self):
+        names_and_content = {
+            ".env": "TOKEN=secret",
+            "id_rsa": "secret",
+            "id_ed25519": "secret",
+            "credentials.json": "{}",
+            "secrets.json": "{}",
+            "client.key": "secret",
+            "certificate.pem": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
+        }
+        for name, content in names_and_content.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = _make_browser_source(root)
+                (source / name).write_text(content, encoding="utf-8")
+                with self.assertRaises(BrowserStagingError):
+                    stage_browser(source, root / "stage", "darwin", "x86_64", "1208")
+
+    def test_rejects_hardlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _make_browser_source(root)
+            original = source / "original.dat"
+            original.write_text("same inode", encoding="utf-8")
+            os.link(original, source / "duplicate.dat")
+            with self.assertRaises(BrowserStagingError):
+                stage_browser(source, root / "stage", "darwin", "x86_64", "1208")
+
+    def test_rejects_fifo_socket_and_other_special_entries(self):
+        factories = {
+            "fifo": lambda path: os.mkfifo(path),
+            "socket": lambda path: _bind_unix_socket(path),
+        }
+        for kind, factory in factories.items():
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = _make_browser_source(root)
+                handle = factory(source / f"special-{kind}")
+                try:
+                    with self.assertRaises(BrowserStagingError):
+                        stage_browser(source, root / "stage", "darwin", "x86_64", "1208")
+                finally:
+                    if handle is not None:
+                        handle.close()
+
     def test_rejects_profile_state_at_any_depth(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -200,6 +274,98 @@ class FrozenSpecificationTests(unittest.TestCase):
 
 
 class ReleaseVerificationTests(unittest.TestCase):
+    def test_requires_both_regular_non_symlink_entry_points(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_release_payload(root)
+            (root / "SocialAutoUpload").unlink()
+            with self.assertRaises(ReleaseVerificationError):
+                verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_release_payload(root)
+            (root / "SocialAutoUpload").unlink()
+            os.symlink("sau", root / "SocialAutoUpload")
+            with self.assertRaises(ReleaseVerificationError):
+                verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+    def test_rejects_post_stage_browser_profile_state(self):
+        for name in ("Default", "Local State", "History", "Preferences"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _make_release_payload(root)
+                state = root / "browsers" / "chromium" / name
+                state.parent.mkdir(parents=True, exist_ok=True)
+                state.write_text("state", encoding="utf-8")
+                with self.assertRaises(ReleaseVerificationError):
+                    verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+    def test_rejects_hardlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_release_payload(root)
+            original = root / "first.txt"
+            original.write_text("same inode", encoding="utf-8")
+            os.link(original, root / "second.txt")
+            with self.assertRaises(ReleaseVerificationError):
+                verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+    def test_rejects_special_entry_without_emitting_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_release_payload(root)
+            os.mkfifo(root / "named-pipe")
+            with self.assertRaises(ReleaseVerificationError):
+                verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+            self.assertFalse((root / "release-manifest.json").exists())
+            self.assertFalse((root / "SHA256SUMS").exists())
+
+    def test_conf_rejects_unknown_assignments_imports_calls_and_statements(self):
+        unsafe_lines = (
+            'API_TOKEN = "secret"',
+            "import os",
+            "print('side effect')",
+            "if True:\n    DEBUG_MODE = True",
+        )
+        for unsafe in unsafe_lines:
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _make_release_payload(root)
+                (root / "conf.py").write_text(_safe_conf_text() + unsafe + "\n", encoding="utf-8")
+                with self.assertRaises(ReleaseVerificationError):
+                    verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+    def test_rejects_checksum_unsafe_paths(self):
+        for name in ("line\nbreak.txt", "carriage\rreturn.txt", "escape\\name.txt", "control\x01name.txt"):
+            with self.subTest(name=repr(name)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _make_release_payload(root)
+                (root / name).write_text("unsafe", encoding="utf-8")
+                with self.assertRaises(ReleaseVerificationError):
+                    verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+
+    def test_manifest_covers_all_contained_symlinks_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_release_payload(root)
+            (root / "library").mkdir()
+            (root / "library" / "version-1").write_text("payload", encoding="utf-8")
+            (root / "target-dir").mkdir()
+            os.symlink("version-1", root / "library" / "Current")
+            os.symlink("target-dir", root / "CurrentDir")
+            first = verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+            first_bytes = (root / "release-manifest.json").read_bytes()
+            second = verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
+            self.assertEqual(first, second)
+            self.assertEqual(first_bytes, (root / "release-manifest.json").read_bytes())
+            self.assertEqual(first["symlink_count"], 2)
+            self.assertEqual(
+                [(item["path"], item["target"]) for item in first["symlinks"]],
+                [("CurrentDir", "target-dir"), ("library/Current", "version-1")],
+            )
+            self.assertTrue(all(len(item["sha256"]) == 64 for item in first["symlinks"]))
+
     def test_missing_frontend_fails_without_writing_release_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -273,7 +439,7 @@ class ReleaseVerificationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "conf.py").write_text(
-                'XHS_SERVER="http://127.0.0.1:11901"\nLOCAL_CHROME_PATH=""\nLOCAL_CHROME_HEADLESS=True\nDEBUG_MODE=True\nYT_PROXY=None\n',
+                _safe_conf_text(),
                 encoding="utf-8",
             )
             first = verify_payload(root, expected_platform="darwin", expected_arch="x86_64")

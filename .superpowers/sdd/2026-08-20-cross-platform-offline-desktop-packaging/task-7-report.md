@@ -84,3 +84,47 @@ are ignored and were not committed.
   without mutating the verified browser payload.
 - This task produced only the native Intel macOS payload. Windows and Apple
   Silicon payloads still require their native Task 9/10 build surfaces.
+
+## Fix round 1
+
+All four Important review findings were reproduced before implementation.
+The directed RED run produced 23 assertion failures and two errors: secret and
+private-key browser sources were accepted, FIFO reached `shutil.copytree`,
+hardlinks and post-stage profile state were ignored, a missing/symlink GUI
+entry point passed, unknown `conf.py` AST was ignored, checksum-unsafe names
+were emitted, and the release manifest had no symlink inventory.
+
+The hardened staging gate now rejects `.env`, SSH keys, credential/secret
+files, private-key suffixes/content, hardlinks, FIFOs, sockets, devices, and
+every filesystem entry other than contained symlinks, directories, and
+single-link regular files. The retained clean Chromium source passes this
+stricter scan.
+
+The release gate now:
+
+- rejects browser `Default`, `Local State`, `History`, `Preferences`, and the
+  existing runtime/profile state set at any depth;
+- rejects hardlinks, FIFO/socket/device/special entries before metadata output;
+- requires both target entry points as executable, non-symlink, single-link
+  regular files with the requested architecture;
+- accepts `conf.py` only when its AST exactly matches the controlled runtime
+  boilerplate and five safe literal settings;
+- rejects CR/LF/control/backslash names and unsafe symlink targets; and
+- emits schema 2 with a deterministic path/target/SHA-256 record for every
+  contained file or directory symlink, while `SHA256SUMS` remains a standard
+  regular-file list without recursive metadata checksums.
+
+Verification after the fix:
+
+- Directed review tests: 10 passed.
+- Focused Task 2/7 tests: 34 passed.
+- Full suite: 235 passed in 11.868 seconds.
+- `compileall`, controlled source `conf.py` comparison, and `git diff --check`
+  passed.
+- The retained 973 MB payload passed twice without a rebuild: both x86_64
+  entry points are regular/non-symlink, all 79 symlinks are covered, and both
+  metadata files were byte-stable.
+- Schema 2 `release-manifest.json` SHA-256:
+  `44f73660f62c00ca6d5e3fbf1a7712ed65ffe1a0b06cb3303ba13d4009ce8a59`.
+- Stable `SHA256SUMS` SHA-256:
+  `8b9e018f61365d954959aab81805e7d53572cd192f0d4e8a31e5796b139bcdf27`.

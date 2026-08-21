@@ -30,6 +30,9 @@ _FORBIDDEN_STATE = {
     "logs",
     "videofile",
 }
+_SECRET_NAMES = {".env", "id_rsa", "id_ed25519", "credentials.json", "secrets.json"}
+_PRIVATE_KEY_SUFFIXES = {".key", ".p12", ".pfx"}
+_PRIVATE_KEY_MARKER = b"PRIVATE KEY-----"
 
 
 def _target_key(platform_name: str, arch: str) -> str:
@@ -87,16 +90,31 @@ def _validate_source(source: Path) -> None:
     for current, directories, files in os.walk(source, followlinks=False):
         for name in [*directories, *files]:
             path = Path(current) / name
-            if name.casefold() in _FORBIDDEN_STATE:
+            lowered = name.casefold()
+            if lowered in _FORBIDDEN_STATE:
                 raise BrowserStagingError(f"Browser source contains runtime/profile state: {path}")
+            if lowered in _SECRET_NAMES or Path(lowered).suffix in _PRIVATE_KEY_SUFFIXES:
+                raise BrowserStagingError(f"Browser source contains a secret/private-key file: {path}")
             mode = path.lstat().st_mode
-            if stat.S_ISSOCK(mode):
-                raise BrowserStagingError(f"Browser source contains a socket: {path}")
-            if path.is_symlink():
+            if stat.S_ISLNK(mode):
                 try:
                     path.resolve(strict=True).relative_to(resolved_source)
                 except (OSError, ValueError) as exc:
                     raise BrowserStagingError(f"Browser source symlink escapes distribution: {path}") from exc
+                continue
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise BrowserStagingError(f"Browser source contains a special filesystem entry: {path}")
+            if path.lstat().st_nlink != 1:
+                raise BrowserStagingError(f"Browser source contains a hard-linked file: {path}")
+            if path.stat().st_size <= 16 * 1024 * 1024 and path.suffix.casefold() == ".pem":
+                try:
+                    content = path.read_bytes()
+                except OSError as exc:
+                    raise BrowserStagingError(f"Cannot inspect browser source file: {path}") from exc
+                if b"-----BEGIN " in content and _PRIVATE_KEY_MARKER in content:
+                    raise BrowserStagingError(f"Browser source contains private-key material: {path}")
 
 
 def _find_executable(root: Path, platform_name: str) -> Path:
@@ -196,4 +214,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

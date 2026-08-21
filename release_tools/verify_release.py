@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import tempfile
+import unicodedata
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
@@ -22,6 +23,10 @@ class ReleaseVerificationError(RuntimeError):
 
 _OUTPUT_FILES = {"release-manifest.json", "SHA256SUMS"}
 _FORBIDDEN_COMPONENTS = {
+    "default",
+    "local state",
+    "history",
+    "preferences",
     "cookies",
     "cookiesfile",
     "profiles",
@@ -43,13 +48,18 @@ _DEVELOPMENT_PATHS = (
     re.compile(rb"[A-Za-z]:[\\/]Users[\\/](?P<user>[^\\/\x00]+)[\\/]"),
 )
 _DOCUMENTATION_USERS = {b"example", b"me", b"test", b"user", b"username"}
-_SAFE_CONF = {
-    "XHS_SERVER": "http://127.0.0.1:11901",
-    "LOCAL_CHROME_PATH": "",
-    "LOCAL_CHROME_HEADLESS": True,
-    "DEBUG_MODE": True,
-    "YT_PROXY": None,
-}
+_SAFE_CONF_SOURCE = """from sau_runtime import get_runtime_paths
+
+_RUNTIME_PATHS = get_runtime_paths()
+BASE_DIR = _RUNTIME_PATHS.data_root
+RESOURCE_DIR = _RUNTIME_PATHS.resource_root
+
+XHS_SERVER = "http://127.0.0.1:11901"
+LOCAL_CHROME_PATH = ""
+LOCAL_CHROME_HEADLESS = True
+DEBUG_MODE = True
+YT_PROXY = None
+"""
 
 
 def _sha256(path: Path) -> str:
@@ -68,29 +78,60 @@ def _target_key(platform_name: str, arch: str) -> tuple[str, str, str]:
     return system, machine, f"{system}-{machine}"
 
 
-def _walk_payload(root: Path) -> list[Path]:
+def _checksum_safe_text(value: str) -> bool:
+    return "\\" not in value and all(
+        unicodedata.category(character) not in {"Cc", "Cs"}
+        for character in value
+    )
+
+
+def _symlink_record(path: Path, root: Path) -> dict[str, str]:
+    relative = path.relative_to(root).as_posix()
+    target = os.readlink(path)
+    if not _checksum_safe_text(target):
+        raise ReleaseVerificationError(f"Checksum-unsafe symlink target: {relative}")
+    digest = hashlib.sha256()
+    digest.update(b"SYMLINK\0")
+    digest.update(os.fsencode(relative))
+    digest.update(b"\0")
+    digest.update(os.fsencode(target))
+    return {"path": relative, "target": target, "sha256": digest.hexdigest()}
+
+
+def _walk_payload(root: Path) -> tuple[list[Path], list[dict[str, str]]]:
     resolved_root = root.resolve(strict=True)
     files: list[Path] = []
+    symlinks: list[dict[str, str]] = []
     for current, directories, names in os.walk(root, followlinks=False):
         for name in [*directories, *names]:
             path = Path(current) / name
             relative = path.relative_to(root)
+            relative_text = relative.as_posix()
+            if not _checksum_safe_text(relative_text):
+                raise ReleaseVerificationError(f"Checksum-unsafe release path: {relative!s}")
             if any(part.casefold() in _FORBIDDEN_COMPONENTS for part in relative.parts):
                 raise ReleaseVerificationError(f"Forbidden runtime/user-data path: {relative}")
             lowered = name.casefold()
             if lowered in _SECRET_NAMES or Path(lowered).suffix in _SECRET_SUFFIXES:
                 raise ReleaseVerificationError(f"Forbidden secret file: {relative}")
             mode = path.lstat().st_mode
-            if stat.S_ISSOCK(mode):
-                raise ReleaseVerificationError(f"Socket is forbidden in release payload: {relative}")
-            if path.is_symlink():
+            if stat.S_ISLNK(mode):
                 try:
                     path.resolve(strict=True).relative_to(resolved_root)
                 except (OSError, ValueError) as exc:
                     raise ReleaseVerificationError(f"Symlink escapes release payload: {relative}") from exc
+                symlinks.append(_symlink_record(path, root))
+            elif stat.S_ISDIR(mode):
+                continue
             elif stat.S_ISREG(mode):
+                if path.lstat().st_nlink != 1:
+                    raise ReleaseVerificationError(f"Hard-linked file is forbidden: {relative}")
                 files.append(path)
-    return sorted(files, key=lambda item: item.relative_to(root).as_posix())
+            else:
+                raise ReleaseVerificationError(f"Special filesystem entry is forbidden: {relative}")
+    files.sort(key=lambda item: item.relative_to(root).as_posix())
+    symlinks.sort(key=lambda item: item["path"])
+    return files, symlinks
 
 
 def _verify_conf(path: Path) -> None:
@@ -98,20 +139,9 @@ def _verify_conf(path: Path) -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, UnicodeError, SyntaxError) as exc:
         raise ReleaseVerificationError(f"Invalid conf.py: {path}") from exc
-    found: dict[str, object] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            value_node = node.value
-            for target in targets:
-                if isinstance(target, ast.Name) and target.id in _SAFE_CONF:
-                    try:
-                        found[target.id] = ast.literal_eval(value_node)
-                    except (ValueError, TypeError) as exc:
-                        raise ReleaseVerificationError(f"Unsafe dynamic conf.py value: {target.id}") from exc
-    for name, value in found.items():
-        if value != _SAFE_CONF[name]:
-            raise ReleaseVerificationError(f"Unsafe conf.py value: {name}")
+    safe_tree = ast.parse(_SAFE_CONF_SOURCE, filename="safe-conf.py")
+    if ast.dump(tree, include_attributes=False) != ast.dump(safe_tree, include_attributes=False):
+        raise ReleaseVerificationError(f"Unsafe or unrecognized conf.py statement: {path}")
 
 
 def _scan_text_files(files: Iterable[Path], root: Path) -> None:
@@ -212,7 +242,7 @@ def verify_payload(
     if not root_path.is_dir() or root_path.is_symlink():
         raise ReleaseVerificationError(f"Release payload root is not a directory: {root_path}")
     platform_name, arch, target_key = _target_key(expected_platform, expected_arch)
-    files = _walk_payload(root_path)
+    files, symlinks = _walk_payload(root_path)
     _scan_text_files(files, root_path)
     resource_root = _resource_root(root_path)
     if not (resource_root / "frontend" / "index.html").is_file():
@@ -221,13 +251,20 @@ def verify_payload(
 
     for executable_name in ("sau.exe", "SocialAutoUpload.exe") if platform_name == "windows" else ("sau", "SocialAutoUpload"):
         executable = root_path / executable_name
-        if executable.exists():
-            try:
-                actual = executable_architecture(executable, platform_name)
-            except BrowserStagingError as exc:
-                raise ReleaseVerificationError(str(exc)) from exc
-            if actual != arch:
-                raise ReleaseVerificationError(f"Executable architecture mismatch: {executable_name}")
+        try:
+            mode = executable.lstat().st_mode
+        except OSError as exc:
+            raise ReleaseVerificationError(f"Required entry point is missing: {executable_name}") from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or executable.lstat().st_nlink != 1:
+            raise ReleaseVerificationError(f"Entry point must be a regular non-linked file: {executable_name}")
+        if platform_name != "windows" and not mode & 0o111:
+            raise ReleaseVerificationError(f"Entry point is not executable: {executable_name}")
+        try:
+            actual = executable_architecture(executable, platform_name)
+        except BrowserStagingError as exc:
+            raise ReleaseVerificationError(str(exc)) from exc
+        if actual != arch:
+            raise ReleaseVerificationError(f"Executable architecture mismatch: {executable_name}")
 
     checksum_files = [
         path for path in files if path.relative_to(root_path).as_posix() not in _OUTPUT_FILES
@@ -239,7 +276,9 @@ def verify_payload(
         "browser_revision": browser_manifest["revision"],
         "file_count": len(checksum_files),
         "platform": platform_name,
-        "schema_version": 1,
+        "schema_version": 2,
+        "symlink_count": len(symlinks),
+        "symlinks": symlinks,
         "total_bytes": sum(path.stat().st_size for path in checksum_files),
     }
     manifest_content = (json.dumps(release_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
