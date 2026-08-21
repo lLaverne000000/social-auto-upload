@@ -1221,16 +1221,18 @@ class DesktopReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("gh release", source.casefold())
         self.assertNotIn("softprops/action-gh-release", source.casefold())
 
-    def test_windows_gui_smokes_probe_new_loopback_health_without_pid_ownership_assumption(self):
+    def test_windows_gui_smokes_use_process_reported_loopback_status_file(self):
         source = self._load_workflow()
         windows = source[
             source.index("  windows-x86_64:"):
             source.index("  macos-universal-package:")
         ]
         self.assertNotIn("Get-NetTCPConnection -OwningProcess", windows)
-        self.assertEqual(windows.count("$BaselinePorts = @{"), 2)
-        self.assertGreaterEqual(windows.count("Get-NetTCPConnection -State Listen"), 4)
-        self.assertEqual(windows.count("$BaselinePorts.ContainsKey"), 2)
+        self.assertNotIn("$BaselinePorts", windows)
+        self.assertNotIn("Get-NetTCPConnection -State Listen", windows)
+        self.assertEqual(windows.count("$env:SAU_DESKTOP_STATUS_FILE = $StatusFile"), 2)
+        self.assertEqual(windows.count("$env:SAU_DESKTOP_STATUS_FILE = $null"), 2)
+        self.assertEqual(windows.count(r"server-ready http://127\.0\.0\.1:"), 2)
         self.assertEqual(windows.count('"$CandidateBase/api/v1/health"'), 2)
         self.assertEqual(windows.count("$Health.ok -eq $true"), 2)
         self.assertEqual(windows.count("$Health.data.status -eq 'ok'"), 2)

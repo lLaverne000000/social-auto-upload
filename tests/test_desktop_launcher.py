@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -118,6 +120,39 @@ class DesktopLauncherTests(unittest.TestCase):
             "app-shutdown",
             "jobs-shutdown",
         ])
+
+    def test_main_reports_server_ready_to_exclusive_private_status_file(self):
+        events, _paths, _jobs, _app_shutdown, _server, patches = self._main_dependencies()
+        with tempfile.TemporaryDirectory() as temp:
+            status_file = Path(temp) / "desktop.status"
+            with patch.dict(
+                os.environ,
+                {"SAU_DESKTOP_STATUS_FILE": str(status_file)},
+                clear=False,
+            ), patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                sau_desktop.main()
+
+            lines = status_file.read_text(encoding="utf-8").splitlines()
+            self.assertIn("starting", lines)
+            self.assertIn("server-ready http://127.0.0.1:49152/", lines)
+            self.assertIn("stopped", lines)
+            self.assertNotIn("process-secret", status_file.read_text(encoding="utf-8"))
+            if os.name != "nt":
+                self.assertEqual(status_file.stat().st_mode & 0o777, 0o600)
+
+    def test_status_file_refuses_to_overwrite_existing_path(self):
+        _events, _paths, _jobs, _app_shutdown, _server, patches = self._main_dependencies()
+        with tempfile.TemporaryDirectory() as temp:
+            status_file = Path(temp) / "desktop.status"
+            status_file.write_text("keep", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {"SAU_DESKTOP_STATUS_FILE": str(status_file)},
+                clear=False,
+            ), patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+                 self.assertRaises(FileExistsError):
+                sau_desktop.main()
+            self.assertEqual(status_file.read_text(encoding="utf-8"), "keep")
 
     def test_source_mode_allows_unbundled_browser(self):
         _events, _paths, _jobs, _app_shutdown, _server, patches = self._main_dependencies()

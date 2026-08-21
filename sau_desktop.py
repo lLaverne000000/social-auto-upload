@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 import secrets
 import sys
 import threading
@@ -24,6 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 _LOOPBACK_HOST = "127.0.0.1"
 _WINDOW_TITLE = "Social Auto Upload"
 _SERVER_READY_TIMEOUT_SECONDS = 5.0
+_STATUS_FILE_ENV = "SAU_DESKTOP_STATUS_FILE"
 
 
 def _exception_category(error: BaseException) -> str:
@@ -31,6 +33,44 @@ def _exception_category(error: BaseException) -> str:
     if not name.isidentifier():
         return "Exception"
     return name[:64]
+
+
+class _DesktopStatusReporter:
+    """Optional no-secret startup handshake for native smoke verification."""
+
+    def __init__(self) -> None:
+        raw_path = os.environ.get(_STATUS_FILE_ENV)
+        self._stream: Any | None = None
+        if raw_path is None:
+            return
+        if not raw_path or "\x00" in raw_path:
+            raise ValueError(f"{_STATUS_FILE_ENV} must name a new file")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(raw_path, flags, 0o600)
+        self._stream = os.fdopen(
+            descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            buffering=1,
+        )
+
+    def emit(self, event: str, value: str | None = None) -> None:
+        if self._stream is None:
+            return
+        line = event if value is None else f"{event} {value}"
+        if "\r" in line or "\n" in line:
+            raise ValueError("desktop status lines must be single-line")
+        self._stream.write(f"{line}\n")
+        self._stream.flush()
+        os.fsync(self._stream.fileno())
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
 
 
 def _probe_server_health(url: str) -> bool:
@@ -235,41 +275,51 @@ def _shutdown_components(server: Any, app: Any, jobs: Any) -> None:
 
 def main() -> None:
     """Configure the offline runtime, start the private API, and own its lifecycle."""
+    status = _DesktopStatusReporter()
     jobs = None
     app = None
     server = None
     stop_event = threading.Event()
     try:
-        paths = get_runtime_paths()
-        configure_browser_environment(
-            paths,
-            required=bool(getattr(sys, "frozen", False)),
-        )
+        status.emit("starting")
+        try:
+            paths = get_runtime_paths()
+            configure_browser_environment(
+                paths,
+                required=bool(getattr(sys, "frozen", False)),
+            )
 
-        # These imports reach sau_cli and uploader modules. They must remain after
-        # browser configuration so every launch helper sees the verified payload.
-        service_module = importlib.import_module("sau_desktop_service")
-        api_module = importlib.import_module("sau_desktop_api")
+            # These imports reach sau_cli and uploader modules. They must remain after
+            # browser configuration so every launch helper sees the verified payload.
+            service_module = importlib.import_module("sau_desktop_service")
+            api_module = importlib.import_module("sau_desktop_api")
 
-        jobs = service_module.JobManager()
-        app = api_module.create_desktop_app(
-            paths=paths,
-            session_token=secrets.token_urlsafe(32),
-            jobs=jobs,
-        )
-        app.extensions["sau_desktop_stop"] = stop_event.set
-        server = start_loopback_server(app)
-        mode = open_desktop_window(
-            server.url,
-            server=server,
-            stop_event=stop_event,
-        )
-        if mode == "browser":
-            server.wait_until_stopped(stop_event)
+            jobs = service_module.JobManager()
+            app = api_module.create_desktop_app(
+                paths=paths,
+                session_token=secrets.token_urlsafe(32),
+                jobs=jobs,
+            )
+            app.extensions["sau_desktop_stop"] = stop_event.set
+            server = start_loopback_server(app)
+            status.emit("server-ready", server.url)
+            mode = open_desktop_window(
+                server.url,
+                server=server,
+                stop_event=stop_event,
+            )
+            if mode == "browser":
+                server.wait_until_stopped(stop_event)
+        finally:
+            _shutdown_components(server, app, jobs)
+            if server is not None:
+                server.raise_if_failed()
+    except BaseException as error:
+        status.emit("error", _exception_category(error))
+        raise
     finally:
-        _shutdown_components(server, app, jobs)
-        if server is not None:
-            server.raise_if_failed()
+        status.emit("stopped")
+        status.close()
 
 
 if __name__ == "__main__":

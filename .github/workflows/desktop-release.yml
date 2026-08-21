@@ -334,42 +334,45 @@ jobs:
       - name: Run frozen GUI smoke
         run: |
           $env:SOCIAL_AUTO_UPLOAD_HOME = Join-Path $env:RUNNER_TEMP 'sau-gui-home'
-          $BaselinePorts = @{}
-          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -eq '127.0.0.1' } |
-            ForEach-Object { $BaselinePorts[[int]$_.LocalPort] = $true }
+          $StatusFile = Join-Path $env:RUNNER_TEMP 'sau-frozen-gui.status'
+          Remove-Item -LiteralPath $StatusFile -Force -ErrorAction SilentlyContinue
+          $env:SAU_DESKTOP_STATUS_FILE = $StatusFile
           $Process = Start-Process .\dist\SocialAutoUpload\SocialAutoUpload.exe -PassThru
           try {
             $Base = $null
             for ($Attempt = 0; $Attempt -lt 200; $Attempt++) {
               if ($Process.HasExited) { throw 'Frozen GUI exited before health readiness.' }
-              $Candidates = @(
-                Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-                  Where-Object {
-                    $_.LocalAddress -eq '127.0.0.1' -and
-                    -not $BaselinePorts.ContainsKey([int]$_.LocalPort)
-                  }
-              )
-              foreach ($Candidate in $Candidates) {
-                $CandidateBase = "http://127.0.0.1:$($Candidate.LocalPort)"
+              $ReadyLine = @(
+                Get-Content -LiteralPath $StatusFile -ErrorAction SilentlyContinue |
+                  Where-Object { $_ -match '^server-ready http://127\.0\.0\.1:[1-9][0-9]{0,4}/$' }
+              ) | Select-Object -Last 1
+              if ($null -ne $ReadyLine) {
+                $CandidateBase = $ReadyLine.Substring('server-ready '.Length).TrimEnd('/')
                 try {
+                  $ReadyUri = [Uri]$CandidateBase
+                  if ($ReadyUri.Scheme -ne 'http' -or $ReadyUri.Host -ne '127.0.0.1' -or $ReadyUri.Port -lt 1) {
+                    throw 'Desktop status reported a non-loopback endpoint.'
+                  }
                   $Health = Invoke-RestMethod -Uri "$CandidateBase/api/v1/health" -TimeoutSec 1
                   if ($Health.ok -eq $true -and $Health.data.status -eq 'ok') {
                     $Base = $CandidateBase
-                    break
                   }
                 } catch {}
               }
               if ($null -ne $Base) { break }
               Start-Sleep -Milliseconds 100
             }
-            if ($null -eq $Base) { throw 'Frozen GUI health endpoint was not found.' }
+            if ($null -eq $Base) {
+              $Status = if (Test-Path -LiteralPath $StatusFile -PathType Leaf) { Get-Content -LiteralPath $StatusFile -Raw } else { 'status-file-missing' }
+              throw "Frozen GUI did not report a healthy endpoint. Status: $Status"
+            }
             $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
             Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
             if (-not $Process.WaitForExit(15000)) { throw 'Frozen GUI did not exit after protected quit.' }
             if ($Process.ExitCode -ne 0) { throw "Frozen GUI exited $($Process.ExitCode)." }
           } finally {
+            $env:SAU_DESKTOP_STATUS_FILE = $null
             if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
           }
       - name: Run silent install smoke
@@ -406,42 +409,45 @@ jobs:
               browser.close()
           '@ | & .\.venv\Scripts\python.exe -
           if ($LASTEXITCODE -ne 0) { throw 'Installed bundled browser failed.' }
-          $BaselinePorts = @{}
-          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -eq '127.0.0.1' } |
-            ForEach-Object { $BaselinePorts[[int]$_.LocalPort] = $true }
+          $StatusFile = Join-Path $env:RUNNER_TEMP 'sau-installed-gui.status'
+          Remove-Item -LiteralPath $StatusFile -Force -ErrorAction SilentlyContinue
+          $env:SAU_DESKTOP_STATUS_FILE = $StatusFile
           $Process = Start-Process "$InstallDir\SocialAutoUpload.exe" -PassThru
           try {
             $Base = $null
             for ($Attempt = 0; $Attempt -lt 200; $Attempt++) {
               if ($Process.HasExited) { throw 'Installed GUI exited before health readiness.' }
-              $Candidates = @(
-                Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-                  Where-Object {
-                    $_.LocalAddress -eq '127.0.0.1' -and
-                    -not $BaselinePorts.ContainsKey([int]$_.LocalPort)
-                  }
-              )
-              foreach ($Candidate in $Candidates) {
-                $CandidateBase = "http://127.0.0.1:$($Candidate.LocalPort)"
+              $ReadyLine = @(
+                Get-Content -LiteralPath $StatusFile -ErrorAction SilentlyContinue |
+                  Where-Object { $_ -match '^server-ready http://127\.0\.0\.1:[1-9][0-9]{0,4}/$' }
+              ) | Select-Object -Last 1
+              if ($null -ne $ReadyLine) {
+                $CandidateBase = $ReadyLine.Substring('server-ready '.Length).TrimEnd('/')
                 try {
+                  $ReadyUri = [Uri]$CandidateBase
+                  if ($ReadyUri.Scheme -ne 'http' -or $ReadyUri.Host -ne '127.0.0.1' -or $ReadyUri.Port -lt 1) {
+                    throw 'Desktop status reported a non-loopback endpoint.'
+                  }
                   $Health = Invoke-RestMethod -Uri "$CandidateBase/api/v1/health" -TimeoutSec 1
                   if ($Health.ok -eq $true -and $Health.data.status -eq 'ok') {
                     $Base = $CandidateBase
-                    break
                   }
                 } catch {}
               }
               if ($null -ne $Base) { break }
               Start-Sleep -Milliseconds 100
             }
-            if ($null -eq $Base) { throw 'Installed GUI health endpoint was not found.' }
+            if ($null -eq $Base) {
+              $Status = if (Test-Path -LiteralPath $StatusFile -PathType Leaf) { Get-Content -LiteralPath $StatusFile -Raw } else { 'status-file-missing' }
+              throw "Installed GUI did not report a healthy endpoint. Status: $Status"
+            }
             $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
             Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
             if (-not $Process.WaitForExit(15000)) { throw 'Installed GUI did not exit after protected quit.' }
             if ($Process.ExitCode -ne 0) { throw "Installed GUI exited $($Process.ExitCode)." }
           } finally {
+            $env:SAU_DESKTOP_STATUS_FILE = $null
             if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
           }
           $Python = "$env:GITHUB_WORKSPACE\.venv\Scripts\python.exe"
