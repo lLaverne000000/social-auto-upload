@@ -274,8 +274,47 @@ class DesktopLauncherTests(unittest.TestCase):
             width=1200,
             height=800,
         )
-        webview.start.assert_called_once_with()
+        webview.start.assert_called_once_with(func=unittest.mock.ANY)
         open_browser.assert_not_called()
+
+    def test_webview_monitor_starts_after_backend_initialization(self):
+        stop_event = threading.Event()
+        stop_event.set()
+        shown = threading.Event()
+        closed = threading.Event()
+        backend_calls: list[str] = []
+
+        class Backend:
+            def destroy_window(self, uid):
+                backend_calls.append(uid)
+                closed.set()
+
+        window = SimpleNamespace(
+            uid="master",
+            gui=None,
+            events=SimpleNamespace(shown=shown, closed=closed),
+            destroy=Mock(side_effect=AssertionError("public destroy waits for shown")),
+        )
+        server = Mock()
+        server.wait_until_stopped.side_effect = lambda stop, _cancel: stop.wait(timeout=1)
+        webview = Mock()
+        webview.create_window.return_value = window
+
+        def start_webview(*, func):
+            window.gui = Backend()
+            func()
+
+        webview.start.side_effect = start_webview
+        with patch("sau_desktop.importlib.import_module", return_value=webview):
+            mode = sau_desktop.open_desktop_window(
+                "http://127.0.0.1:49152/",
+                server=server,
+                stop_event=stop_event,
+            )
+
+        self.assertEqual(mode, "webview")
+        self.assertEqual(backend_calls, ["master"])
+        window.destroy.assert_not_called()
 
     def test_webview_close_bypasses_shown_wait_during_early_protected_quit(self):
         shown = threading.Event()
@@ -323,8 +362,9 @@ class DesktopLauncherTests(unittest.TestCase):
         webview = Mock()
         webview.create_window.return_value = window
 
-        def webview_start():
+        def webview_start(*, func):
             crash_server.set()
+            func()
             self.assertTrue(window_destroyed.wait(timeout=2))
 
         webview.start.side_effect = webview_start
@@ -372,8 +412,9 @@ class DesktopLauncherTests(unittest.TestCase):
         webview = Mock()
         webview.create_window.return_value = window
 
-        def start_webview():
+        def start_webview(*, func):
             crash_server.set()
+            func()
             self.assertTrue(window_destroyed.wait(timeout=2))
 
         webview.start.side_effect = start_webview

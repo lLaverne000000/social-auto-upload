@@ -298,17 +298,14 @@ def open_desktop_window(
                     _exception_category(error),
                 )
 
-        monitor = threading.Thread(
-            target=monitor_server,
-            name="sau-webview-monitor",
-            daemon=True,
-        )
-        monitor.start()
         try:
-            webview.start()
+            # Let PyWebView start the monitor only after it has selected and
+            # initialized its native GUI backend. Starting our own thread before
+            # ``webview.start`` races Windows backend creation and can leave the
+            # WinForms loop alive after a protected early quit.
+            webview.start(func=monitor_server)
         finally:
             monitor_cancel.set()
-            monitor.join(timeout=1.0)
         return "webview"
     except Exception as error:
         _LOGGER.error(
