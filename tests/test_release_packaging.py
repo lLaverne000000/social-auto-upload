@@ -1059,6 +1059,7 @@ class MacOSPackagingTests(unittest.TestCase):
 
 class DesktopReleaseWorkflowTests(unittest.TestCase):
     workflow_path = Path(__file__).parents[1] / ".github" / "workflows" / "desktop-release.yml"
+    macos_smoke_path = Path(__file__).parents[1] / "release_tools" / "smoke_macos_install.py"
 
     def _load_workflow(self):
         self.assertTrue(self.workflow_path.is_file(), "desktop release workflow must exist")
@@ -1098,7 +1099,9 @@ class DesktopReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("runs-on: macos-15-intel", source)
         self.assertIn("runs-on: macos-15", source)
         self.assertIn("runs-on: windows-2025", source)
-        self.assertIn("runner: [macos-15, ubuntu-24.04]", source)
+        release = source[source.index("  release-verification:"):]
+        self.assertIn("runs-on: macos-15", release)
+        self.assertNotIn("matrix:", release)
         self.assertEqual(source.count("timeout-minutes:"), 6)
         uses_lines = [line.strip() for line in source.splitlines() if line.strip().startswith("uses:")]
         self.assertTrue(uses_lines)
@@ -1109,7 +1112,7 @@ class DesktopReleaseWorkflowTests(unittest.TestCase):
     def test_release_workflow_verifies_native_payloads_smokes_and_exact_final_artifacts(self):
         source = self._load_workflow()
         self.assertEqual(source.count("npm ci"), 4)
-        self.assertEqual(source.count("uv sync --frozen"), 3)
+        self.assertEqual(source.count("uv sync --frozen"), 5)
         self.assertEqual(source.count("release_tools.stage_browser"), 3)
         self.assertGreaterEqual(source.count("release_tools.verify_release"), 3)
         self.assertEqual(source.count("frozen CLI smoke"), 3)
@@ -1130,6 +1133,35 @@ class DesktopReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("verify exactly two installers", source)
         self.assertNotIn("gh release", source.casefold())
         self.assertNotIn("softprops/action-gh-release", source.casefold())
+
+    def test_final_release_is_uploaded_only_after_serial_native_and_payload_verification(self):
+        source = self._load_workflow()
+        universal_start = source.index("  macos-universal-package:")
+        release_start = source.index("  release-verification:")
+        universal = source[universal_start:release_start]
+        release = source[release_start:]
+        self.assertEqual(universal.count("release_tools.smoke_macos_install"), 1)
+        self.assertEqual(release.count("release_tools.smoke_macos_install"), 1)
+        self.assertIn("pkgutil --expand-full", release)
+        self.assertIn("release_tools.verify_release", release)
+        self.assertEqual(release.count("verify_and_compare \\"), 3)
+        self.assertGreaterEqual(release.count("cmp "), 4)
+        self.assertIn("sau-windows-installed-payload", release)
+        self.assertIn("windows-installed-payload.tar", source)
+        native_smoke = release.index("Verify the uploaded package natively on Apple Silicon")
+        rehash = release.index("Rehash exact packaged and installed payloads")
+        final_upload = release.index("Upload final verified release bundle")
+        self.assertLess(native_smoke, rehash)
+        self.assertLess(rehash, final_upload)
+
+    def test_shared_macos_installed_smoke_covers_external_cli_gui_and_browser(self):
+        self.assertTrue(self.macos_smoke_path.is_file(), "shared macOS installed smoke must exist")
+        source = self.macos_smoke_path.read_text(encoding="utf-8")
+        self.assertIn("/usr/local/bin/sau", source)
+        self.assertIn("/api/v1/health", source)
+        self.assertIn("/api/v1/app/quit", source)
+        self.assertIn("browser-manifest.json", source)
+        self.assertIn("sync_playwright", source)
 
 
 if __name__ == "__main__":
