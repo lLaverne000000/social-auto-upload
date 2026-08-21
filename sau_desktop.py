@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import importlib
 import json
 import logging
@@ -251,7 +252,23 @@ def _destroy_webview_window(window: Any, *, timeout: float = 5.0) -> None:
         gui = getattr(window, "gui", None)
         destroy_window = getattr(gui, "destroy_window", None)
         uid = getattr(window, "uid", None)
-        if callable(destroy_window) and isinstance(uid, str) and uid:
+        if sys.platform == "win32" and isinstance(uid, str) and uid:
+            try:
+                browser_view = getattr(gui, "BrowserView", None)
+                instances = getattr(browser_view, "instances", None)
+                instance = instances.get(uid) if callable(getattr(instances, "get", None)) else None
+                handle = getattr(instance, "Handle", None)
+                to_int64 = getattr(handle, "ToInt64", None)
+                native_handle = int(to_int64()) if callable(to_int64) else 0
+                if native_handle > 0:
+                    # WinForms' public backend uses synchronous Control.Invoke,
+                    # which can block forever in a Windows service session.
+                    # WM_CLOSE is asynchronous and is handled by the same native
+                    # message loop and FormClosing/FormClosed lifecycle.
+                    ctypes.windll.user32.PostMessageW(native_handle, 0x0010, 0, 0)
+            except Exception:
+                pass
+        elif callable(destroy_window) and isinstance(uid, str) and uid:
             try:
                 destroy_window(uid)
             except Exception:

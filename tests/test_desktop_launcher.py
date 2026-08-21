@@ -352,6 +352,40 @@ class DesktopLauncherTests(unittest.TestCase):
         self.assertEqual(set(backend_calls), {"master"})
         window.destroy.assert_not_called()
 
+    def test_windows_early_close_posts_wm_close_without_blocking_backend_invoke(self):
+        shown = threading.Event()
+        closed = threading.Event()
+        instance = SimpleNamespace(
+            Handle=SimpleNamespace(ToInt64=Mock(return_value=49152)),
+        )
+        backend_destroy = Mock(
+            side_effect=AssertionError("WinForms Control.Invoke can block indefinitely")
+        )
+        gui = SimpleNamespace(
+            BrowserView=SimpleNamespace(instances={"master": instance}),
+            destroy_window=backend_destroy,
+        )
+        post_message = Mock(side_effect=lambda *_args: (closed.set(), 1)[1])
+        ctypes_module = SimpleNamespace(
+            windll=SimpleNamespace(
+                user32=SimpleNamespace(PostMessageW=post_message),
+            )
+        )
+        window = SimpleNamespace(
+            uid="master",
+            gui=gui,
+            events=SimpleNamespace(shown=shown, closed=closed),
+            destroy=Mock(side_effect=AssertionError("public destroy waits for shown")),
+        )
+
+        with patch.object(sys, "platform", "win32"), \
+             patch("sau_desktop.ctypes", ctypes_module, create=True):
+            sau_desktop._destroy_webview_window(window, timeout=0.5)
+
+        post_message.assert_called_once_with(49152, 0x0010, 0, 0)
+        backend_destroy.assert_not_called()
+        window.destroy.assert_not_called()
+
     def test_live_server_failure_destroys_webview_and_is_observable(self):
         server_ready = threading.Event()
         crash_server = threading.Event()
