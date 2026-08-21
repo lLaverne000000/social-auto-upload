@@ -469,6 +469,82 @@ class ReleaseVerificationTests(unittest.TestCase):
                 verify_payload(root, expected_platform="darwin", expected_arch="x86_64")
 
 
+class WindowsPackagingTests(unittest.TestCase):
+    installer_source = Path(__file__).parents[1] / "packaging" / "windows" / "SocialAutoUpload.iss"
+    build_script = Path(__file__).parents[1] / "packaging" / "windows" / "build_installer.ps1"
+
+    def test_windows_installer_is_current_user_offline_and_keeps_runtime_data(self):
+        self.assertTrue(self.installer_source.is_file(), "Windows Inno Setup definition must exist")
+        source = self.installer_source.read_text(encoding="utf-8")
+        self.assertIn("PrivilegesRequired=lowest", source)
+        self.assertIn(r"DefaultDirName={localappdata}\Programs\SocialAutoUpload", source)
+        self.assertIn("UninstallDisplayName=Social Auto Upload", source)
+        self.assertIn("UninstallDisplayIcon={app}\\SocialAutoUpload.exe", source)
+        self.assertNotIn("http://", source.casefold())
+        self.assertNotIn("https://", source.casefold())
+        self.assertNotIn(r"{localappdata}\SocialAutoUpload", source)
+
+    def test_windows_installer_includes_verified_payload_and_all_shortcuts(self):
+        self.assertTrue(self.installer_source.is_file(), "Windows Inno Setup definition must exist")
+        source = self.installer_source.read_text(encoding="utf-8")
+        self.assertIn(r'Source: "{#PayloadDir}\*"', source)
+        self.assertIn("recursesubdirs", source)
+        self.assertIn("createallsubdirs", source)
+        self.assertIn(r'Filename: "{app}\SocialAutoUpload.exe"', source)
+        self.assertIn(r'Filename: "{app}\sau.exe"', source)
+        self.assertIn(r'Name: "{autodesktop}\Social Auto Upload"', source)
+        self.assertIn(r'Name: "{group}\Social Auto Upload"', source)
+        self.assertIn(r'Name: "{group}\Social Auto Upload Command Line"', source)
+
+    def test_windows_path_task_is_unchecked_and_user_scoped_only(self):
+        self.assertTrue(self.installer_source.is_file(), "Windows Inno Setup definition must exist")
+        source = self.installer_source.read_text(encoding="utf-8")
+        self.assertIn('Name: "addtopath"', source)
+        self.assertIn("Flags: unchecked", source)
+        self.assertIn("HKCU", source)
+        self.assertNotIn("HKLM", source)
+        self.assertNotIn("HKEY_LOCAL_MACHINE", source)
+        self.assertNotIn("machine", source.casefold())
+
+    def test_windows_builder_runs_locked_clean_native_pipeline(self):
+        self.assertTrue(self.build_script.is_file(), "Windows build wrapper must exist")
+        source = self.build_script.read_text(encoding="utf-8")
+        self.assertIn("$ErrorActionPreference = 'Stop'", source)
+        self.assertIn("npm.cmd", source)
+        self.assertIn("ci", source)
+        self.assertIn("run", source)
+        self.assertIn("build", source)
+        self.assertIn("release_tools.stage_browser", source)
+        self.assertIn("$env:PYTHONPATH", source)
+        self.assertIn("--platform", source)
+        self.assertIn("windows", source)
+        self.assertIn("--arch", source)
+        self.assertIn("x86_64", source)
+        self.assertIn("PyInstaller", source)
+        self.assertIn("release_tools.verify_release", source)
+        self.assertIn("Get-AuthenticodeSignature", source)
+        self.assertIn("Get-FileHash", source)
+        self.assertIn("SHA256", source)
+        self.assertNotIn("Invoke-WebRequest", source)
+        self.assertNotIn("Start-BitsTransfer", source)
+        self.assertNotIn("http://", source.casefold())
+        self.assertNotIn("https://", source.casefold())
+
+    def test_windows_builder_preserves_old_installer_until_verified_temporary_output_exists(self):
+        self.assertTrue(self.build_script.is_file(), "Windows build wrapper must exist")
+        source = self.build_script.read_text(encoding="utf-8")
+        temporary = source.index("$TemporaryInstaller")
+        compile_step = source.index("ISCC", temporary)
+        hash_step = source.index("Get-FileHash", compile_step)
+        signature_step = source.index("Get-AuthenticodeSignature", hash_step)
+        replace_step = source.index("Move-Item", signature_step)
+        self.assertLess(temporary, compile_step)
+        self.assertLess(compile_step, hash_step)
+        self.assertLess(hash_step, signature_step)
+        self.assertLess(signature_step, replace_step)
+        self.assertNotIn("Remove-Item -LiteralPath $OutputInstaller", source)
+
+
 class MacOSPackagingTests(unittest.TestCase):
     launcher_source = Path(__file__).parents[1] / "packaging" / "macos" / "launcher"
     build_script = Path(__file__).parents[1] / "packaging" / "macos" / "build_pkg.sh"
