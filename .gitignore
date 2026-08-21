@@ -31,6 +31,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!packaging/pyinstaller/social_auto_upload.spec
+packaging/browser-stage/
 
 # Installer logs
 pip-log.txt
@@ -122,6 +124,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.build-venv/
 env/
 venv/
 ENV/
