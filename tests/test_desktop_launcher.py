@@ -278,6 +278,30 @@ class DesktopLauncherTests(unittest.TestCase):
         webview.start.assert_called_once_with(func=unittest.mock.ANY)
         open_browser.assert_not_called()
 
+    def test_windows_github_service_session_uses_headless_gui_lifecycle(self):
+        status_events: list[str] = []
+        with patch.object(sys, "platform", "win32"), \
+             patch.dict(
+                 os.environ,
+                 {"GITHUB_ACTIONS": "true", "RUNNER_OS": "Windows"},
+                 clear=False,
+             ), \
+             patch.object(sau_desktop.webbrowser, "open") as open_browser, \
+             patch(
+                 "sau_desktop.importlib.import_module",
+                 side_effect=AssertionError("service session must not initialize WinForms"),
+             ):
+            mode = sau_desktop.open_desktop_window(
+                "http://127.0.0.1:49152/",
+                server=Mock(),
+                stop_event=threading.Event(),
+                status_callback=status_events.append,
+            )
+
+        self.assertEqual(mode, "headless")
+        self.assertEqual(status_events, ["windows-ci-headless"])
+        open_browser.assert_not_called()
+
     def test_webview_monitor_starts_after_backend_initialization(self):
         stop_event = threading.Event()
         stop_event.set()

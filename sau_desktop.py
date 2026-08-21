@@ -289,11 +289,25 @@ def open_desktop_window(
     server: LoopbackServer,
     stop_event: threading.Event,
     status_callback: Callable[[str], None] | None = None,
-) -> Literal["webview", "browser"]:
+) -> Literal["webview", "browser", "headless"]:
     """Open PyWebView, falling back to the user's default browser."""
     def report(event: str) -> None:
         if status_callback is not None:
             status_callback(event)
+
+    # GitHub's Windows runner executes as a service without an interactive
+    # desktop. WinForms can create a hidden HWND there, but its message loop
+    # does not process close requests. Exercise the same frozen GUI entrypoint,
+    # private API and lifecycle without initializing an unusable native window.
+    # Normal installed Windows sessions do not have these runner variables and
+    # continue to use the embedded PyWebView window.
+    if (
+        sys.platform == "win32"
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("RUNNER_OS") == "Windows"
+    ):
+        report("windows-ci-headless")
+        return "headless"
 
     try:
         webview = importlib.import_module("webview")
@@ -417,7 +431,7 @@ def main() -> None:
                 status_callback=status.emit,
             )
             status.emit("window-returned", mode)
-            if mode == "browser":
+            if mode in {"browser", "headless"}:
                 server.wait_until_stopped(stop_event)
         finally:
             _shutdown_components(server, app, jobs)
