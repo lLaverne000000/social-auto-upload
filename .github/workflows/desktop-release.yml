@@ -334,18 +334,36 @@ jobs:
       - name: Run frozen GUI smoke
         run: |
           $env:SOCIAL_AUTO_UPLOAD_HOME = Join-Path $env:RUNNER_TEMP 'sau-gui-home'
+          $BaselinePorts = @{}
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalAddress -eq '127.0.0.1' } |
+            ForEach-Object { $BaselinePorts[[int]$_.LocalPort] = $true }
           $Process = Start-Process .\dist\SocialAutoUpload\SocialAutoUpload.exe -PassThru
           try {
-            $Connection = $null
-            for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+            $Base = $null
+            for ($Attempt = 0; $Attempt -lt 200; $Attempt++) {
               if ($Process.HasExited) { throw 'Frozen GUI exited before health readiness.' }
-              $Connection = Get-NetTCPConnection -OwningProcess $Process.Id -State Listen -ErrorAction SilentlyContinue |
-                Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1
-              if ($null -ne $Connection) { break }
+              $Candidates = @(
+                Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                  Where-Object {
+                    $_.LocalAddress -eq '127.0.0.1' -and
+                    -not $BaselinePorts.ContainsKey([int]$_.LocalPort)
+                  }
+              )
+              foreach ($Candidate in $Candidates) {
+                $CandidateBase = "http://127.0.0.1:$($Candidate.LocalPort)"
+                try {
+                  $Health = Invoke-RestMethod -Uri "$CandidateBase/api/v1/health" -TimeoutSec 1
+                  if ($Health.ok -eq $true -and $Health.data.status -eq 'ok') {
+                    $Base = $CandidateBase
+                    break
+                  }
+                } catch {}
+              }
+              if ($null -ne $Base) { break }
               Start-Sleep -Milliseconds 100
             }
-            if ($null -eq $Connection) { throw 'Frozen GUI loopback listener was not found.' }
-            $Base = "http://127.0.0.1:$($Connection.LocalPort)"
+            if ($null -eq $Base) { throw 'Frozen GUI health endpoint was not found.' }
             $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
             Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
@@ -388,18 +406,36 @@ jobs:
               browser.close()
           '@ | & .\.venv\Scripts\python.exe -
           if ($LASTEXITCODE -ne 0) { throw 'Installed bundled browser failed.' }
+          $BaselinePorts = @{}
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalAddress -eq '127.0.0.1' } |
+            ForEach-Object { $BaselinePorts[[int]$_.LocalPort] = $true }
           $Process = Start-Process "$InstallDir\SocialAutoUpload.exe" -PassThru
           try {
-            $Connection = $null
-            for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+            $Base = $null
+            for ($Attempt = 0; $Attempt -lt 200; $Attempt++) {
               if ($Process.HasExited) { throw 'Installed GUI exited before health readiness.' }
-              $Connection = Get-NetTCPConnection -OwningProcess $Process.Id -State Listen -ErrorAction SilentlyContinue |
-                Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1
-              if ($null -ne $Connection) { break }
+              $Candidates = @(
+                Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                  Where-Object {
+                    $_.LocalAddress -eq '127.0.0.1' -and
+                    -not $BaselinePorts.ContainsKey([int]$_.LocalPort)
+                  }
+              )
+              foreach ($Candidate in $Candidates) {
+                $CandidateBase = "http://127.0.0.1:$($Candidate.LocalPort)"
+                try {
+                  $Health = Invoke-RestMethod -Uri "$CandidateBase/api/v1/health" -TimeoutSec 1
+                  if ($Health.ok -eq $true -and $Health.data.status -eq 'ok') {
+                    $Base = $CandidateBase
+                    break
+                  }
+                } catch {}
+              }
+              if ($null -ne $Base) { break }
               Start-Sleep -Milliseconds 100
             }
-            if ($null -eq $Connection) { throw 'Installed GUI loopback listener was not found.' }
-            $Base = "http://127.0.0.1:$($Connection.LocalPort)"
+            if ($null -eq $Base) { throw 'Installed GUI health endpoint was not found.' }
             $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
             Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
