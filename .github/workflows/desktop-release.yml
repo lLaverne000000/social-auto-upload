@@ -1,0 +1,635 @@
+name: Offline desktop release
+
+"on":
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "24.19.0"
+  UV_VERSION: "0.12.5"
+  BROWSER_REVISION: "1208"
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: sau_frontend/package-lock.json
+      - name: Install locked frontend dependencies and test
+        working-directory: sau_frontend
+        run: |
+          npm ci
+          npm run test:frontend
+          npm run build
+
+  macos-x86_64:
+    needs: frontend
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+      - name: Cache locked Python downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/uv
+          key: macos-x86_64-uv-${{ hashFiles('uv.lock') }}
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: sau_frontend/package-lock.json
+      - name: Install locked Python and frontend dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          uv sync --frozen --extra desktop --extra build
+          cd sau_frontend
+          npm ci
+          npm run build
+      - name: Download and stage clean matching Chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/patchright-browsers
+        run: |
+          .venv/bin/python -m patchright install chromium
+          test -d "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${BROWSER_REVISION}"
+          .venv/bin/python -m release_tools.stage_browser \
+            --source "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${BROWSER_REVISION}" \
+            --target packaging/browser-stage --platform darwin --arch x86_64 \
+            --revision "${BROWSER_REVISION}"
+      - name: Build and verify native x86_64 frozen payload
+        env:
+          SAU_PROJECT_ROOT: ${{ github.workspace }}
+          SAU_FRONTEND_DIST: ${{ github.workspace }}/sau_frontend/dist
+          SAU_BROWSER_STAGE: ${{ github.workspace }}/packaging/browser-stage
+        run: |
+          .venv/bin/python -m PyInstaller --clean --noconfirm \
+            --workpath build/pyinstaller-macos-x86_64 --distpath dist \
+            packaging/pyinstaller/social_auto_upload.spec
+          .venv/bin/python -m release_tools.verify_release \
+            --root dist/SocialAutoUpload --platform darwin --arch x86_64
+          file dist/SocialAutoUpload/sau dist/SocialAutoUpload/SocialAutoUpload
+      - name: Run frozen CLI smoke
+        env:
+          SOCIAL_AUTO_UPLOAD_HOME: ${{ runner.temp }}/sau-cli-home
+        run: dist/SocialAutoUpload/sau --help
+      - name: Run bundled browser smoke
+        run: |
+          .venv/bin/python - <<'PY'
+          import json
+          from pathlib import Path
+          from patchright.sync_api import sync_playwright
+          root = Path("dist/SocialAutoUpload/_internal")
+          manifest = json.loads((root / "browser-manifest.json").read_text())
+          executable = root / manifest["payloads"]["darwin-x86_64"]["executable"]
+          with sync_playwright() as api:
+              browser = api.chromium.launch(executable_path=str(executable), headless=True)
+              page = browser.new_page()
+              page.goto("data:text/html,<title>SAU Offline</title><p>browser-ok</p>")
+              assert page.title() == "SAU Offline"
+              assert page.locator("p").inner_text() == "browser-ok"
+              browser.close()
+          PY
+      - name: Run frozen GUI smoke
+        env:
+          SOCIAL_AUTO_UPLOAD_HOME: ${{ runner.temp }}/sau-gui-home
+        run: |
+          dist/SocialAutoUpload/SocialAutoUpload >"${RUNNER_TEMP}/sau-gui.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          port=""
+          for _ in $(seq 1 100); do
+            port=$(lsof -Pan -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null | awk '/127\.0\.0\.1:/ {sub(/^.*:/, "", $9); print $9; exit}')
+            [[ -n "$port" ]] && break
+            kill -0 "$pid" 2>/dev/null || { cat "${RUNNER_TEMP}/sau-gui.log"; exit 1; }
+            sleep 0.1
+          done
+          [[ -n "$port" ]]
+          base="http://127.0.0.1:${port}"
+          curl --fail --silent --show-error --cookie-jar "${RUNNER_TEMP}/cookies" "${base}/" >/dev/null
+          curl --fail --silent --show-error --cookie "${RUNNER_TEMP}/cookies" \
+            --header "Origin: ${base}" --request POST "${base}/api/v1/app/quit" >/dev/null
+          wait "$pid"
+          trap - EXIT
+      - name: Archive verified x86_64 payload without losing symlinks
+        run: |
+          mkdir -p artifacts
+          tar -C dist -cf artifacts/sau-macos-x86_64-payload.tar SocialAutoUpload
+          cd artifacts
+          shasum -a 256 sau-macos-x86_64-payload.tar >sau-macos-x86_64-payload.tar.sha256
+      - name: Upload verified x86_64 payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sau-macos-x86_64-payload
+          path: |
+            artifacts/sau-macos-x86_64-payload.tar
+            artifacts/sau-macos-x86_64-payload.tar.sha256
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          include-hidden-files: true
+
+  macos-arm64:
+    needs: frontend
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: arm64
+      - name: Cache locked Python downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.cache/uv
+          key: macos-arm64-uv-${{ hashFiles('uv.lock') }}
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: sau_frontend/package-lock.json
+      - name: Install locked Python and frontend dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          uv sync --frozen --extra desktop --extra build
+          cd sau_frontend
+          npm ci
+          npm run build
+      - name: Download and stage clean matching Chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/patchright-browsers
+        run: |
+          .venv/bin/python -m patchright install chromium
+          test -d "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${BROWSER_REVISION}"
+          .venv/bin/python -m release_tools.stage_browser \
+            --source "${PLAYWRIGHT_BROWSERS_PATH}/chromium-${BROWSER_REVISION}" \
+            --target packaging/browser-stage --platform darwin --arch arm64 \
+            --revision "${BROWSER_REVISION}"
+      - name: Build and verify native arm64 frozen payload
+        env:
+          SAU_PROJECT_ROOT: ${{ github.workspace }}
+          SAU_FRONTEND_DIST: ${{ github.workspace }}/sau_frontend/dist
+          SAU_BROWSER_STAGE: ${{ github.workspace }}/packaging/browser-stage
+        run: |
+          .venv/bin/python -m PyInstaller --clean --noconfirm \
+            --workpath build/pyinstaller-macos-arm64 --distpath dist \
+            packaging/pyinstaller/social_auto_upload.spec
+          .venv/bin/python -m release_tools.verify_release \
+            --root dist/SocialAutoUpload --platform darwin --arch arm64
+          file dist/SocialAutoUpload/sau dist/SocialAutoUpload/SocialAutoUpload
+      - name: Run frozen CLI smoke
+        env:
+          SOCIAL_AUTO_UPLOAD_HOME: ${{ runner.temp }}/sau-cli-home
+        run: dist/SocialAutoUpload/sau --help
+      - name: Run bundled browser smoke
+        run: |
+          .venv/bin/python - <<'PY'
+          import json
+          from pathlib import Path
+          from patchright.sync_api import sync_playwright
+          root = Path("dist/SocialAutoUpload/_internal")
+          manifest = json.loads((root / "browser-manifest.json").read_text())
+          executable = root / manifest["payloads"]["darwin-arm64"]["executable"]
+          with sync_playwright() as api:
+              browser = api.chromium.launch(executable_path=str(executable), headless=True)
+              page = browser.new_page()
+              page.goto("data:text/html,<title>SAU Offline</title><p>browser-ok</p>")
+              assert page.title() == "SAU Offline"
+              assert page.locator("p").inner_text() == "browser-ok"
+              browser.close()
+          PY
+      - name: Run frozen GUI smoke
+        env:
+          SOCIAL_AUTO_UPLOAD_HOME: ${{ runner.temp }}/sau-gui-home
+        run: |
+          dist/SocialAutoUpload/SocialAutoUpload >"${RUNNER_TEMP}/sau-gui.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          port=""
+          for _ in $(seq 1 100); do
+            port=$(lsof -Pan -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null | awk '/127\.0\.0\.1:/ {sub(/^.*:/, "", $9); print $9; exit}')
+            [[ -n "$port" ]] && break
+            kill -0 "$pid" 2>/dev/null || { cat "${RUNNER_TEMP}/sau-gui.log"; exit 1; }
+            sleep 0.1
+          done
+          [[ -n "$port" ]]
+          base="http://127.0.0.1:${port}"
+          curl --fail --silent --show-error --cookie-jar "${RUNNER_TEMP}/cookies" "${base}/" >/dev/null
+          curl --fail --silent --show-error --cookie "${RUNNER_TEMP}/cookies" \
+            --header "Origin: ${base}" --request POST "${base}/api/v1/app/quit" >/dev/null
+          wait "$pid"
+          trap - EXIT
+      - name: Archive verified arm64 payload without losing symlinks
+        run: |
+          mkdir -p artifacts
+          tar -C dist -cf artifacts/sau-macos-arm64-payload.tar SocialAutoUpload
+          cd artifacts
+          shasum -a 256 sau-macos-arm64-payload.tar >sau-macos-arm64-payload.tar.sha256
+      - name: Upload verified arm64 payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sau-macos-arm64-payload
+          path: |
+            artifacts/sau-macos-arm64-payload.tar
+            artifacts/sau-macos-arm64-payload.tar.sha256
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+          include-hidden-files: true
+
+  windows-x86_64:
+    needs: frontend
+    runs-on: windows-2025
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: x64
+      - name: Cache locked Python downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~\AppData\Local\uv\cache
+          key: windows-x86_64-uv-${{ hashFiles('uv.lock') }}
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: sau_frontend/package-lock.json
+      - name: Install locked Python and frontend dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "uv==$env:UV_VERSION"
+          uv sync --frozen --extra desktop --extra build
+          Push-Location sau_frontend
+          try { npm ci } finally { Pop-Location }
+      - name: Download clean matching Chromium and build installer
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}\patchright-browsers
+        run: |
+          $Python = "$env:GITHUB_WORKSPACE\.venv\Scripts\python.exe"
+          & $Python -m patchright install chromium
+          if ($LASTEXITCODE -ne 0) { throw 'Patchright Chromium download failed.' }
+          $BrowserSource = Join-Path $env:PLAYWRIGHT_BROWSERS_PATH "chromium-$env:BROWSER_REVISION"
+          if (-not (Test-Path -LiteralPath $BrowserSource -PathType Container)) { throw 'Matching Chromium directory is missing.' }
+          # release_tools.stage_browser is invoked fail-closed by build_installer.ps1.
+          .\packaging\windows\build_installer.ps1 -BrowserSource $BrowserSource -BrowserRevision $env:BROWSER_REVISION -PythonExecutable $Python
+          & $Python -m release_tools.verify_release --root dist\SocialAutoUpload --platform windows --arch x86_64
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release verification failed.' }
+      - name: Run frozen CLI smoke
+        run: |
+          $env:SOCIAL_AUTO_UPLOAD_HOME = Join-Path $env:RUNNER_TEMP 'sau-cli-home'
+          & .\dist\SocialAutoUpload\sau.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen CLI smoke failed.' }
+      - name: Run bundled browser smoke
+        run: |
+          @'
+          import json
+          from pathlib import Path
+          from patchright.sync_api import sync_playwright
+          root = Path("dist/SocialAutoUpload/_internal")
+          manifest = json.loads((root / "browser-manifest.json").read_text())
+          executable = root / manifest["payloads"]["windows-x86_64"]["executable"]
+          with sync_playwright() as api:
+              browser = api.chromium.launch(executable_path=str(executable), headless=True)
+              page = browser.new_page()
+              page.goto("data:text/html,<title>SAU Offline</title><p>browser-ok</p>")
+              assert page.title() == "SAU Offline"
+              assert page.locator("p").inner_text() == "browser-ok"
+              browser.close()
+          '@ | & .\.venv\Scripts\python.exe -
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled browser smoke failed.' }
+      - name: Run frozen GUI smoke
+        run: |
+          $env:SOCIAL_AUTO_UPLOAD_HOME = Join-Path $env:RUNNER_TEMP 'sau-gui-home'
+          $Process = Start-Process .\dist\SocialAutoUpload\SocialAutoUpload.exe -PassThru
+          try {
+            $Connection = $null
+            for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+              if ($Process.HasExited) { throw 'Frozen GUI exited before health readiness.' }
+              $Connection = Get-NetTCPConnection -OwningProcess $Process.Id -State Listen -ErrorAction SilentlyContinue |
+                Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1
+              if ($null -ne $Connection) { break }
+              Start-Sleep -Milliseconds 100
+            }
+            if ($null -eq $Connection) { throw 'Frozen GUI loopback listener was not found.' }
+            $Base = "http://127.0.0.1:$($Connection.LocalPort)"
+            $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
+            Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
+            if (-not $Process.WaitForExit(15000)) { throw 'Frozen GUI did not exit after protected quit.' }
+            if ($Process.ExitCode -ne 0) { throw "Frozen GUI exited $($Process.ExitCode)." }
+          } finally {
+            if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
+          }
+      - name: Run silent install smoke
+        run: |
+          $Installer = Resolve-Path .\release\SocialAutoUpload-Windows-x64-Setup.exe
+          $InstallDir = Join-Path $env:RUNNER_TEMP 'SocialAutoUpload-installed'
+          $Result = Start-Process $Installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/DIR=$InstallDir") -Wait -PassThru
+          if ($Result.ExitCode -ne 0) { throw "Silent installer exited $($Result.ExitCode)." }
+          if (-not (Test-Path "$InstallDir\sau.exe" -PathType Leaf)) { throw 'Installed CLI is missing.' }
+      - name: Run installed CLI GUI browser and uninstall and data preservation smoke
+        run: |
+          $InstallDir = Join-Path $env:RUNNER_TEMP 'SocialAutoUpload-installed'
+          $DataRoot = Join-Path $env:LOCALAPPDATA 'SocialAutoUpload'
+          New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
+          $Sentinel = Join-Path $DataRoot 'ci-preserve.txt'
+          Set-Content -LiteralPath $Sentinel -Value 'preserve' -NoNewline
+          & "$InstallDir\sau.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed.' }
+          $env:SAU_INSTALL_DIR = $InstallDir
+          @'
+          import json
+          import os
+          from pathlib import Path
+          from patchright.sync_api import sync_playwright
+          root = Path(os.environ["SAU_INSTALL_DIR"]) / "_internal"
+          manifest = json.loads((root / "browser-manifest.json").read_text())
+          executable = root / manifest["payloads"]["windows-x86_64"]["executable"]
+          with sync_playwright() as api:
+              browser = api.chromium.launch(executable_path=str(executable), headless=True)
+              page = browser.new_page()
+              page.goto("data:text/html,<title>Installed SAU</title><p>installed-browser-ok</p>")
+              assert page.title() == "Installed SAU"
+              assert page.locator("p").inner_text() == "installed-browser-ok"
+              browser.close()
+          '@ | & .\.venv\Scripts\python.exe -
+          if ($LASTEXITCODE -ne 0) { throw 'Installed bundled browser failed.' }
+          $Process = Start-Process "$InstallDir\SocialAutoUpload.exe" -PassThru
+          try {
+            $Connection = $null
+            for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+              if ($Process.HasExited) { throw 'Installed GUI exited before health readiness.' }
+              $Connection = Get-NetTCPConnection -OwningProcess $Process.Id -State Listen -ErrorAction SilentlyContinue |
+                Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1
+              if ($null -ne $Connection) { break }
+              Start-Sleep -Milliseconds 100
+            }
+            if ($null -eq $Connection) { throw 'Installed GUI loopback listener was not found.' }
+            $Base = "http://127.0.0.1:$($Connection.LocalPort)"
+            $Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            Invoke-RestMethod -Uri "$Base/" -WebSession $Session | Out-Null
+            Invoke-RestMethod -Method Post -Uri "$Base/api/v1/app/quit" -WebSession $Session -Headers @{ Origin = $Base } | Out-Null
+            if (-not $Process.WaitForExit(15000)) { throw 'Installed GUI did not exit after protected quit.' }
+            if ($Process.ExitCode -ne 0) { throw "Installed GUI exited $($Process.ExitCode)." }
+          } finally {
+            if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force }
+          }
+          $Uninstaller = Get-ChildItem -LiteralPath $InstallDir -Filter 'unins*.exe' | Select-Object -First 1
+          if ($null -eq $Uninstaller) { throw 'Uninstaller is missing.' }
+          $Result = Start-Process $Uninstaller.FullName -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -Wait -PassThru
+          if ($Result.ExitCode -ne 0) { throw "Uninstaller exited $($Result.ExitCode)." }
+          if (Test-Path -LiteralPath "$InstallDir\sau.exe") { throw 'Uninstall left the installed CLI behind.' }
+          if (-not (Test-Path -LiteralPath $Sentinel -PathType Leaf)) { throw 'Uninstall removed user data.' }
+          Remove-Item -LiteralPath $Sentinel -Force
+      - name: Collect Windows verification metadata
+        run: |
+          Copy-Item .\dist\SocialAutoUpload\release-manifest.json .\release\windows-x86_64-release-manifest.json
+          Copy-Item .\dist\SocialAutoUpload\SHA256SUMS .\release\windows-x86_64-SHA256SUMS
+      - name: Upload verified Windows installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sau-windows-x86_64-installer
+          path: |
+            release/SocialAutoUpload-Windows-x64-Setup.exe
+            release/SocialAutoUpload-Windows-x64-Setup.exe.sha256
+            release/windows-x86_64-release-manifest.json
+            release/windows-x86_64-SHA256SUMS
+          retention-days: 3
+          if-no-files-found: error
+
+  macos-universal-package:
+    needs: [macos-x86_64, macos-arm64]
+    runs-on: macos-15-intel
+    timeout-minutes: 75
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        id: package-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Download verified x86_64 payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sau-macos-x86_64-payload
+          path: ${{ runner.temp }}/payload-artifacts/x86_64
+      - name: Download verified arm64 payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sau-macos-arm64-payload
+          path: ${{ runner.temp }}/payload-artifacts/arm64
+      - name: Verify and extract native payload archives
+        run: |
+          cd "${RUNNER_TEMP}/payload-artifacts/x86_64"
+          shasum -a 256 -c sau-macos-x86_64-payload.tar.sha256
+          mkdir -p "${RUNNER_TEMP}/payloads/x86_64"
+          tar -xf sau-macos-x86_64-payload.tar -C "${RUNNER_TEMP}/payloads/x86_64"
+          cd "${RUNNER_TEMP}/payload-artifacts/arm64"
+          shasum -a 256 -c sau-macos-arm64-payload.tar.sha256
+          mkdir -p "${RUNNER_TEMP}/payloads/arm64"
+          tar -xf sau-macos-arm64-payload.tar -C "${RUNNER_TEMP}/payloads/arm64"
+      - name: Assemble and inspect unsigned universal package
+        env:
+          SAU_PYTHON: ${{ steps.package-python.outputs.python-path }}
+        run: |
+          packaging/macos/build_pkg.sh \
+            "${RUNNER_TEMP}/payloads/x86_64/SocialAutoUpload" \
+            "${RUNNER_TEMP}/payloads/arm64/SocialAutoUpload" release
+          rm -rf "${RUNNER_TEMP}/expanded-package"
+          pkgutil --expand-full release/SocialAutoUpload-macOS-Universal.pkg "${RUNNER_TEMP}/expanded-package"
+          test -x "${RUNNER_TEMP}/expanded-package"/*/Payload/Applications/Social\ Auto\ Upload.app/Contents/MacOS/launcher
+      - name: Verify unsigned signature check
+        run: |
+          set +e
+          output=$(pkgutil --check-signature release/SocialAutoUpload-macOS-Universal.pkg 2>&1)
+          status=$?
+          set -e
+          [[ $status -ne 0 ]]
+          grep -qi 'no signature' <<<"$output"
+      - name: Run native package install smoke
+        env:
+          SOCIAL_AUTO_UPLOAD_HOME: ${{ runner.temp }}/sau-installed-home
+        run: |
+          app="/Applications/Social Auto Upload.app"
+          cli="/usr/local/bin/sau"
+          [[ ! -e "$app" ]]
+          [[ ! -e "$cli" && ! -L "$cli" ]]
+          cleanup() {
+            sudo rm -rf -- "$app"
+            if [[ -f "$cli" ]] && grep -Fq '/Applications/Social Auto Upload.app/Contents/MacOS/sau' "$cli"; then
+              sudo rm -f -- "$cli"
+            fi
+          }
+          trap cleanup EXIT
+          sudo installer -pkg release/SocialAutoUpload-macOS-Universal.pkg -target /
+          "$app/Contents/MacOS/sau" --help
+          selected=$(uname -m)
+          [[ -x "$app/Contents/Resources/payloads/${selected}/sau" ]]
+          cleanup
+          trap - EXIT
+      - name: Collect macOS verification metadata
+        run: |
+          pkg=release/SocialAutoUpload-macOS-Universal.pkg
+          digest=$(shasum -a 256 "$pkg" | awk '{print $1}')
+          printf '%s  %s\n' "$digest" "$(basename "$pkg")" >"${pkg}.sha256"
+          cp "${RUNNER_TEMP}/payloads/x86_64/SocialAutoUpload/release-manifest.json" release/macos-x86_64-release-manifest.json
+          cp "${RUNNER_TEMP}/payloads/x86_64/SocialAutoUpload/SHA256SUMS" release/macos-x86_64-SHA256SUMS
+          cp "${RUNNER_TEMP}/payloads/arm64/SocialAutoUpload/release-manifest.json" release/macos-arm64-release-manifest.json
+          cp "${RUNNER_TEMP}/payloads/arm64/SocialAutoUpload/SHA256SUMS" release/macos-arm64-SHA256SUMS
+      - name: Upload verified universal macOS installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sau-macos-universal-installer
+          path: |
+            release/SocialAutoUpload-macOS-Universal.pkg
+            release/SocialAutoUpload-macOS-Universal.pkg.sha256
+            release/macos-x86_64-release-manifest.json
+            release/macos-x86_64-SHA256SUMS
+            release/macos-arm64-release-manifest.json
+            release/macos-arm64-SHA256SUMS
+          retention-days: 3
+          if-no-files-found: error
+
+  release-verification:
+    needs: [windows-x86_64, macos-universal-package]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Download verified macOS installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sau-macos-universal-installer
+          path: final/macos
+      - name: Download verified Windows installer
+        if: matrix.runner == 'ubuntu-24.04'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sau-windows-x86_64-installer
+          path: final/windows
+      - name: Verify the uploaded package natively on Apple Silicon
+        if: matrix.runner == 'macos-15'
+        env:
+          SOCIAL_AUTO_UPLOAD_HOME: ${{ runner.temp }}/sau-final-arm64-home
+        run: |
+          pkg="final/macos/SocialAutoUpload-macOS-Universal.pkg"
+          app="/Applications/Social Auto Upload.app"
+          cli="/usr/local/bin/sau"
+          [[ ! -e "$app" ]]
+          [[ ! -e "$cli" && ! -L "$cli" ]]
+          cleanup() {
+            sudo rm -rf -- "$app"
+            if [[ -f "$cli" ]] && grep -Fq '/Applications/Social Auto Upload.app/Contents/MacOS/sau' "$cli"; then
+              sudo rm -f -- "$cli"
+            fi
+          }
+          trap cleanup EXIT
+          sudo installer -pkg "$pkg" -target /
+          [[ $(uname -m) == "arm64" ]]
+          "$app/Contents/MacOS/sau" --help
+          [[ -x "$app/Contents/Resources/payloads/arm64/sau" ]]
+          cleanup
+          trap - EXIT
+      - name: verify exactly two installers and all manifests and checksums
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("final")
+          expected = {
+              root / "macos": {
+                  "SocialAutoUpload-macOS-Universal.pkg",
+                  "SocialAutoUpload-macOS-Universal.pkg.sha256",
+                  "macos-x86_64-release-manifest.json",
+                  "macos-x86_64-SHA256SUMS",
+                  "macos-arm64-release-manifest.json",
+                  "macos-arm64-SHA256SUMS",
+              },
+              root / "windows": {
+                  "SocialAutoUpload-Windows-x64-Setup.exe",
+                  "SocialAutoUpload-Windows-x64-Setup.exe.sha256",
+                  "windows-x86_64-release-manifest.json",
+                  "windows-x86_64-SHA256SUMS",
+              },
+          }
+          for directory, names in expected.items():
+              actual = {path.name for path in directory.iterdir() if path.is_file()}
+              if actual != names:
+                  raise SystemExit(f"unexpected release files in {directory}: {sorted(actual)}")
+          installers = [
+              root / "macos" / "SocialAutoUpload-macOS-Universal.pkg",
+              root / "windows" / "SocialAutoUpload-Windows-x64-Setup.exe",
+          ]
+          if len(installers) != 2 or not all(path.is_file() and path.stat().st_size for path in installers):
+              raise SystemExit("exactly two non-empty installers are required")
+          for installer in installers:
+              sidecar = installer.with_name(installer.name + ".sha256")
+              expected_hash, expected_name = sidecar.read_text(encoding="ascii").split()
+              if expected_name != installer.name:
+                  raise SystemExit(f"checksum filename mismatch: {sidecar}")
+              actual_hash = hashlib.sha256(installer.read_bytes()).hexdigest()
+              if actual_hash != expected_hash:
+                  raise SystemExit(f"installer checksum mismatch: {installer}")
+          declarations = (
+              (root / "macos" / "macos-x86_64-release-manifest.json", "darwin", "x86_64"),
+              (root / "macos" / "macos-arm64-release-manifest.json", "darwin", "arm64"),
+              (root / "windows" / "windows-x86_64-release-manifest.json", "windows", "x86_64"),
+          )
+          for manifest_path, platform, arch in declarations:
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+              if manifest.get("schema_version") != 2 or manifest.get("platform") != platform or manifest.get("arch") != arch:
+                  raise SystemExit(f"payload manifest mismatch: {manifest_path}")
+              sums = manifest_path.with_name(manifest_path.name.replace("release-manifest.json", "SHA256SUMS"))
+              if not sums.is_file() or not sums.read_text(encoding="utf-8").strip():
+                  raise SystemExit(f"payload checksums missing: {sums}")
+          print("verified exactly two installers plus three native payload manifests/checksums")
+          PY
+      - name: Upload final verified release bundle
+        if: matrix.runner == 'ubuntu-24.04'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sau-verified-desktop-installers
+          path: final
+          retention-days: 3
+          if-no-files-found: error

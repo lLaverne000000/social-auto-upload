@@ -1057,5 +1057,80 @@ class MacOSPackagingTests(unittest.TestCase):
             self.assertEqual(list(output.glob(".SocialAutoUpload-macOS-Universal.*")), [])
 
 
+class DesktopReleaseWorkflowTests(unittest.TestCase):
+    workflow_path = Path(__file__).parents[1] / ".github" / "workflows" / "desktop-release.yml"
+
+    def _load_workflow(self):
+        self.assertTrue(self.workflow_path.is_file(), "desktop release workflow must exist")
+        source = self.workflow_path.read_text(encoding="utf-8")
+        return source
+
+    def test_release_workflow_is_manual_or_version_tag_only_and_least_privilege(self):
+        source = self._load_workflow()
+        self.assertIn("workflow_dispatch:", source)
+        self.assertIn("tags:\n      - \"v*\"", source)
+        self.assertIn("permissions:\n  contents: read", source)
+        self.assertIn("cancel-in-progress: true", source)
+        self.assertNotIn("pull_request:", source)
+        self.assertNotIn("pull_request_target:", source)
+
+    def test_release_workflow_uses_exact_native_targets_and_pinned_actions(self):
+        source = self._load_workflow()
+        job_names = set()
+        in_jobs = False
+        for line in source.splitlines():
+            if line == "jobs:":
+                in_jobs = True
+                continue
+            if in_jobs and line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+                job_names.add(line.strip()[:-1])
+        self.assertEqual(
+            job_names,
+            {
+                "frontend",
+                "macos-x86_64",
+                "macos-arm64",
+                "windows-x86_64",
+                "macos-universal-package",
+                "release-verification",
+            },
+        )
+        self.assertIn("runs-on: macos-15-intel", source)
+        self.assertIn("runs-on: macos-15", source)
+        self.assertIn("runs-on: windows-2025", source)
+        self.assertIn("runner: [macos-15, ubuntu-24.04]", source)
+        self.assertEqual(source.count("timeout-minutes:"), 6)
+        uses_lines = [line.strip() for line in source.splitlines() if line.strip().startswith("uses:")]
+        self.assertTrue(uses_lines)
+        for line in uses_lines:
+            with self.subTest(action=line):
+                self.assertRegex(line, r"^uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40} +# v[0-9]")
+
+    def test_release_workflow_verifies_native_payloads_smokes_and_exact_final_artifacts(self):
+        source = self._load_workflow()
+        self.assertEqual(source.count("npm ci"), 4)
+        self.assertEqual(source.count("uv sync --frozen"), 3)
+        self.assertEqual(source.count("release_tools.stage_browser"), 3)
+        self.assertGreaterEqual(source.count("release_tools.verify_release"), 3)
+        self.assertEqual(source.count("frozen CLI smoke"), 3)
+        self.assertEqual(source.count("frozen GUI smoke"), 3)
+        self.assertEqual(source.count("bundled browser smoke"), 3)
+        self.assertIn("build_installer.ps1", source)
+        self.assertIn("silent install smoke", source)
+        self.assertIn("uninstall and data preservation smoke", source)
+        self.assertIn("build_pkg.sh", source)
+        self.assertIn("pkgutil", source)
+        self.assertIn("unsigned signature check", source)
+        self.assertIn("native package install smoke", source)
+        self.assertIn("Verify the uploaded package natively on Apple Silicon", source)
+        self.assertIn("SocialAutoUpload-macOS-Universal.pkg", source)
+        self.assertIn("SocialAutoUpload-Windows-x64-Setup.exe", source)
+        self.assertIn("release-manifest.json", source)
+        self.assertIn("SHA256SUMS", source)
+        self.assertIn("verify exactly two installers", source)
+        self.assertNotIn("gh release", source.casefold())
+        self.assertNotIn("softprops/action-gh-release", source.casefold())
+
+
 if __name__ == "__main__":
     unittest.main()
