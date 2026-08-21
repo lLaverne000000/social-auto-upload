@@ -176,6 +176,36 @@ class ReleaseForbiddenPathTests(unittest.TestCase):
 
 
 class FrozenSpecificationTests(unittest.TestCase):
+    def test_locked_desktop_build_environment_includes_both_browser_clients(self):
+        uv = shutil.which("uv")
+        if uv is None:
+            self.skipTest("uv is required to verify the locked release environment")
+        root = Path(__file__).parents[1]
+        exported = subprocess.run(
+            [
+                uv,
+                "export",
+                "--frozen",
+                "--extra",
+                "desktop",
+                "--extra",
+                "build",
+                "--format",
+                "requirements-txt",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        locked_requirements = {
+            line.split(" ", 1)[0]
+            for line in exported.splitlines()
+            if line and not line.startswith(("#", " ", "-e"))
+        }
+        self.assertIn("patchright==1.58.2", locked_requirements)
+        self.assertIn("playwright==1.58.0", locked_requirements)
+
     def test_native_build_pins_the_locally_verified_opencv_release(self):
         metadata = (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"opencv-python==4.12.0.88"', metadata)
@@ -542,6 +572,23 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertNotIn("Start-BitsTransfer", source)
         self.assertNotIn("http://", source.casefold())
         self.assertNotIn("https://", source.casefold())
+
+    def test_windows_builder_resolves_executables_without_conflicting_get_command_parameters(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        self.assertIn("function Resolve-ApplicationPath", source)
+        resolver = source[
+            source.index("function Resolve-ApplicationPath"):
+            source.index("function Get-ContainedPath")
+        ]
+        self.assertIn("[IO.Path]::IsPathFullyQualified", resolver)
+        self.assertIn("Get-Item -LiteralPath", resolver)
+        self.assertIn("Get-Command -Name $Name -ErrorAction Stop", resolver)
+        self.assertIn("[Management.Automation.CommandTypes]::Application", resolver)
+        self.assertNotIn("-CommandType", resolver)
+        self.assertNotRegex(source, r"Get-Command[^\r\n]+-CommandType")
+        self.assertIn("Resolve-ApplicationPath -Name $PythonExecutable", source)
+        self.assertIn("Resolve-ApplicationPath -Name 'npm.cmd'", source)
+        self.assertIn("Resolve-ApplicationPath -Name 'ISCC.exe'", source)
 
     def test_windows_builder_preserves_old_installer_until_verified_temporary_output_exists(self):
         self.assertTrue(self.build_script.is_file(), "Windows build wrapper must exist")
