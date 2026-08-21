@@ -1,5 +1,14 @@
 # 安装说明
 
+本页说明从源码安装和开发环境准备。如果你拿到的是经原生 macOS/Windows 验证的离线
+安装包，不需要克隆仓库、Codex、Python、Node.js 或单独下载 Chromium，请直接看：
+
+- [离线桌面版安装与使用](./desktop-install.md)
+
+离线桌面版是“GUI + CLI”组合：macOS 的一个 `.pkg` 同时携带 Intel 和 Apple Silicon
+两套原生载荷，Windows x64 安装到当前用户目录；GUI 和 CLI 继续共用人工确认、并发锁、
+冷却、去重、风险熔断和审计。打包不会提供反检测绕过，也不能保证账号不被平台限制。
+
 这个文档分成两部分：
 
 - `For Humans`：给正常使用仓库的开发者、创作者、CLI 用户看

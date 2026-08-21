@@ -96,8 +96,18 @@
 
 安装、更新、环境准备已经统一收敛到文档：
 
+- [离线桌面版安装说明（GUI + CLI，macOS Intel/Apple Silicon、Windows x64）](./docs/desktop-install.md)
 - [安装说明](./docs/install.md)
 - [更新说明](./docs/update.md)
+
+如果你拿到的是经过原生验证的离线安装包，优先看“离线桌面版安装说明”。桌面版安装后
+不依赖 Codex、源码目录、系统 Python、Node.js 或首次 Chromium 下载；macOS 的一个
+`.pkg` 内含 Intel 和 Apple Silicon 两套原生载荷，Windows `.exe` 按当前用户安装。
+当前源码目录或 CI 配置本身不等于已经完成原生验证的安装包。
+
+桌面版以 GUI 为日常入口，同时保留完整 `sau` CLI。两种入口共用账号数据、离线浏览器
+和发布治理；人工确认、并发锁、冷却、去重、风险熔断和审计不会因打包而取消。
+封装只降低安装门槛，不能保证避开平台的人机识别、内容审核或账号限制。
 
 
 ### AGENT 

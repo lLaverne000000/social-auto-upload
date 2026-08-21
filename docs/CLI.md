@@ -16,7 +16,12 @@
 实现说明：
 
 - `sau_cli.py` 是当前 CLI 的主入口和唯一主要实现文件
-- `sau.exe` 是安装后在 Windows 虚拟环境里自动生成的命令入口，本质上还是调用 `sau_cli.py`
+- 源码模式的 `sau.exe` 是 Windows 虚拟环境生成的入口；离线桌面版则携带独立冻结的
+  `sau.exe`，不依赖虚拟环境
+- 离线桌面安装包保留同一套完整 CLI；GUI 目前覆盖抖音、快手、视频号和小红书，其他
+  已接入平台继续通过 CLI 使用
+- 安装包模式下，CLI 与 GUI 共用版本、账号数据、内置 Chromium 和发布治理，不需要
+  Codex、源码目录、系统 Python、Node.js 或另行执行 `patchright install chromium`
 - 如果需要给 OpenClaw、Codex 等 agent 使用，可参考仓库内 skill：
   - `skills/douyin-upload/`
   - `skills/kuaishou-upload/`
@@ -26,6 +31,31 @@
 视频号、百家号和支付宝生活号目前只有 CLI 入口，暂未提供对应的 skill。
 
 ## 安装 CLI 入口
+
+### 离线桌面安装包
+
+macOS 安装位置是 `/Applications/Social Auto Upload.app`。安装器在条件允许且不覆盖
+现有命令时创建 `/usr/local/bin/sau`；如果 `sau --help` 找不到命令，直接执行：
+
+```bash
+"/Applications/Social Auto Upload.app/Contents/MacOS/sau" --help
+```
+
+同一个 macOS `.pkg` 携带 `x86_64` 和 `arm64` 两套原生 CLI/浏览器载荷，并按当前
+Mac 架构选择，不依赖 Rosetta 冒充另一架构。
+
+Windows x64 默认按当前用户安装到
+`%LOCALAPPDATA%\Programs\SocialAutoUpload`。用户 PATH 选项默认不勾选；未加入 PATH
+时，从开始菜单的 `Social Auto Upload Command Line` 快捷方式启动，或执行：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\SocialAutoUpload\sau.exe" --help
+```
+
+安装、未签名系统提示、离线浏览器验证和卸载见
+[离线桌面版安装说明](./desktop-install.md)。
+
+### 源码安装
 
 如果你希望直接使用 `sau` 命令，而不是手动执行 `python sau_cli.py`，先在项目根目录安装一次：
 
@@ -49,6 +79,9 @@ sau youtube --help
 ```
 
 ## 安装 patchright 浏览器
+
+以下步骤只用于源码安装。离线桌面安装包已经携带经过清单校验的 Chromium；桌面版
+不要另行下载浏览器来覆盖或掩盖缺失/损坏的安装载荷。
 
 Windows 下推荐先指定镜像，再安装 Chromium：
 
