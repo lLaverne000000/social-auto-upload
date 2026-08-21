@@ -127,4 +127,4 @@ Verification after the fix:
 - Schema 2 `release-manifest.json` SHA-256:
   `44f73660f62c00ca6d5e3fbf1a7712ed65ffe1a0b06cb3303ba13d4009ce8a59`.
 - Stable `SHA256SUMS` SHA-256:
-  `8b9e018f61365d954959aab81805e7d53572cd192f0d4e8a31e5796b139bcdf27`.
+  `8b9e018f61365d954959aab81805e7d53572cd1920d4e8a31e5796b139bcdf27`.
