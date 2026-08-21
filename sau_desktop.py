@@ -284,23 +284,30 @@ def main() -> None:
         status.emit("starting")
         try:
             paths = get_runtime_paths()
+            status.emit("runtime-ready")
             configure_browser_environment(
                 paths,
                 required=bool(getattr(sys, "frozen", False)),
             )
+            status.emit("browser-ready")
 
             # These imports reach sau_cli and uploader modules. They must remain after
             # browser configuration so every launch helper sees the verified payload.
             service_module = importlib.import_module("sau_desktop_service")
+            status.emit("service-ready")
             api_module = importlib.import_module("sau_desktop_api")
+            status.emit("api-ready")
 
             jobs = service_module.JobManager()
+            status.emit("jobs-ready")
             app = api_module.create_desktop_app(
                 paths=paths,
                 session_token=secrets.token_urlsafe(32),
                 jobs=jobs,
             )
+            status.emit("app-ready")
             app.extensions["sau_desktop_stop"] = stop_event.set
+            status.emit("server-starting")
             server = start_loopback_server(app)
             status.emit("server-ready", server.url)
             mode = open_desktop_window(

@@ -133,9 +133,18 @@ class DesktopLauncherTests(unittest.TestCase):
                 sau_desktop.main()
 
             lines = status_file.read_text(encoding="utf-8").splitlines()
-            self.assertIn("starting", lines)
-            self.assertIn("server-ready http://127.0.0.1:49152/", lines)
-            self.assertIn("stopped", lines)
+            self.assertEqual(lines, [
+                "starting",
+                "runtime-ready",
+                "browser-ready",
+                "service-ready",
+                "api-ready",
+                "jobs-ready",
+                "app-ready",
+                "server-starting",
+                "server-ready http://127.0.0.1:49152/",
+                "stopped",
+            ])
             self.assertNotIn("process-secret", status_file.read_text(encoding="utf-8"))
             if os.name != "nt":
                 self.assertEqual(status_file.stat().st_mode & 0o777, 0o600)
