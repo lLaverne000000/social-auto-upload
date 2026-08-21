@@ -91,18 +91,23 @@ fi
 mkdir -p -- "$output_directory"
 output_directory=$(CDPATH= cd -P -- "$output_directory" && pwd -P)
 output_package="${output_directory}/${PACKAGE_NAME}"
-if [[ -L "$output_package" || -d "$output_package" ]]; then
-    die "refusing to replace a symlink or directory output: $output_package"
+if [[ -L "$output_package" || ( -e "$output_package" && ! -f "$output_package" ) ]]; then
+    die "refusing to replace a symlink or non-regular output: $output_package"
 fi
-rm -f -- "$output_package"
 
 staging_root=$(mktemp -d "${TMPDIR:-/tmp}/sau-macos-package.XXXXXX")
+output_staging_directory=""
 cleanup() {
+    if [[ -n ${output_staging_directory:-} && -d "$output_staging_directory" ]]; then
+        rm -rf -- "$output_staging_directory"
+    fi
     if [[ -n ${staging_root:-} && -d "$staging_root" ]]; then
         rm -rf -- "$staging_root"
     fi
 }
 trap cleanup EXIT HUP INT TERM
+output_staging_directory=$(mktemp -d "${output_directory}/.SocialAutoUpload-macOS-Universal.XXXXXX")
+temporary_output_package="${output_staging_directory}/${PACKAGE_NAME}"
 
 package_root="${staging_root}/root"
 app="${package_root}/Applications/Social Auto Upload.app"
@@ -145,24 +150,55 @@ cat >"${scripts_directory}/postinstall" <<'POSTINSTALL'
 #!/bin/sh
 set -eu
 
+script_directory=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd -P)
 target_volume=${3:-/}
 case "$target_volume" in
     /*) ;;
     *) exit 0 ;;
 esac
 
-cli_directory="${target_volume%/}/usr/local/bin"
+target_prefix=${target_volume%/}
+usr_directory="${target_prefix}/usr"
+local_directory="${usr_directory}/local"
+cli_directory="${local_directory}/bin"
 cli_link="${cli_directory}/sau"
-if [ -d "$cli_directory" ] && [ -w "$cli_directory" ]; then
-    if [ -e "$cli_link" ] && [ ! -L "$cli_link" ]; then
-        printf 'Social Auto Upload: preserving existing non-symlink %s\n' "$cli_link" >&2
+expected_self_target="/Applications/Social Auto Upload.app/Contents/MacOS/sau"
+
+for component in "$usr_directory" "$local_directory" "$cli_directory"; do
+    if [ -L "$component" ]; then
+        printf 'Social Auto Upload: skipping CLI install through symlink component %s\n' "$component" >&2
         exit 0
     fi
-    ln -sfn "/Applications/Social Auto Upload.app/Contents/MacOS/sau" "$cli_link"
+    if [ ! -d "$component" ]; then
+        exit 0
+    fi
+done
+
+if [ ! -w "$cli_directory" ]; then
+    exit 0
 fi
+if [ -L "$cli_link" ]; then
+    existing_target=$(readlink "$cli_link") || exit 0
+    if [ "$existing_target" = "$expected_self_target" ]; then
+        exit 0
+    fi
+    printf 'Social Auto Upload: preserving existing foreign symlink %s\n' "$cli_link" >&2
+    exit 0
+fi
+if [ -e "$cli_link" ]; then
+    printf 'Social Auto Upload: preserving existing non-symlink %s\n' "$cli_link" >&2
+    exit 0
+fi
+install -m 0755 "${script_directory}/cli-wrapper" "$cli_link"
 exit 0
 POSTINSTALL
 chmod 0755 "${scripts_directory}/postinstall"
+
+cat >"${scripts_directory}/cli-wrapper" <<'CLI_WRAPPER'
+#!/bin/sh
+exec "/Applications/Social Auto Upload.app/Contents/MacOS/sau" "$@"
+CLI_WRAPPER
+chmod 0755 "${scripts_directory}/cli-wrapper"
 
 component_package="${staging_root}/SocialAutoUpload-component.pkg"
 pkgbuild \
@@ -172,7 +208,12 @@ pkgbuild \
     --version "0.1.0" \
     --install-location "/" \
     "$component_package"
-productbuild --package "$component_package" "$output_package"
+productbuild --package "$component_package" "$temporary_output_package"
 
-[[ -f "$output_package" ]] || die "productbuild did not create the expected package: $output_package"
+if [[ -L "$temporary_output_package" || ! -f "$temporary_output_package" ]]; then
+    die "productbuild did not create a regular package: $temporary_output_package"
+fi
+mv -f -- "$temporary_output_package" "$output_package"
+[[ -f "$output_package" && ! -L "$output_package" ]] || \
+    die "atomic package replacement failed: $output_package"
 printf 'Created unsigned macOS package: %s\n' "$output_package"

@@ -486,7 +486,10 @@ class MacOSPackagingTests(unittest.TestCase):
                 executable.write_text(
                     "#!/bin/sh\n"
                     f"printf '%s\\n' '{label}-{arch}'\n"
-                    "printf '%s\\n' \"$@\"\n",
+                    "printf '%s\\n' \"$@\"\n"
+                    "if [ \"${SAU_TEST_EXIT_CODE:-0}\" -ne 0 ]; then\n"
+                    "    exit \"$SAU_TEST_EXIT_CODE\"\n"
+                    "fi\n",
                     encoding="utf-8",
                 )
                 executable.chmod(0o755)
@@ -510,6 +513,28 @@ class MacOSPackagingTests(unittest.TestCase):
         _make_release_payload(x86)
         _make_release_payload(arm, cpu_type=0x0100000C, arch="arm64")
         return x86, arm
+
+    def _build_and_expand_native_fixture(self, root: Path) -> tuple[Path, Path]:
+        x86, arm = self._make_native_payloads(root)
+        output = root / "release"
+        build = subprocess.run(
+            ["bash", str(self.build_script), str(x86), str(arm), str(output)],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "SAU_PYTHON": sys.executable},
+        )
+        self.assertEqual(build.returncode, 0, build.stderr)
+        package = output / "SocialAutoUpload-macOS-Universal.pkg"
+        expanded = root / "expanded"
+        inspect = subprocess.run(
+            ["pkgutil", "--expand-full", str(package), str(expanded)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(inspect.returncode, 0, inspect.stderr)
+        postinstalls = list(expanded.rglob("postinstall"))
+        self.assertEqual(len(postinstalls), 1)
+        return package, postinstalls[0]
 
     def test_macos_launcher_selects_exact_gui_and_cli_payload_for_runtime_arch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -540,6 +565,28 @@ class MacOSPackagingTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unsupported", result.stderr.casefold())
             self.assertEqual(result.stdout, "")
+
+    def test_macos_cli_symlink_invocation_resolves_app_launcher_and_preserves_argv_and_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            macos = self._make_launcher_fixture(root)
+            installed_bin = root / "usr/local/bin"
+            installed_bin.mkdir(parents=True)
+            installed_cli = installed_bin / "sau"
+            installed_cli.symlink_to(macos / "sau")
+            environment = self._launcher_environment(root, "x86_64")
+            environment["SAU_TEST_EXIT_CODE"] = "37"
+            result = subprocess.run(
+                [str(installed_cli), "first argument", "second"],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 37, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["cli-x86_64", "first argument", "second"],
+            )
 
     def test_macos_launcher_does_not_use_eval_or_arch_translation(self):
         self.assertTrue(self.launcher_source.is_file(), "macOS launcher must exist")
@@ -654,11 +701,169 @@ class MacOSPackagingTests(unittest.TestCase):
             )
             self.assertEqual(cli_result.returncode, 0, cli_result.stderr)
             installed_cli = with_bin / "usr/local/bin/sau"
-            self.assertTrue(installed_cli.is_symlink())
+            self.assertTrue(installed_cli.is_file())
+            self.assertFalse(installed_cli.is_symlink())
+            self.assertTrue(os.access(installed_cli, os.X_OK))
             self.assertEqual(
-                os.readlink(installed_cli),
-                "/Applications/Social Auto Upload.app/Contents/MacOS/sau",
+                installed_cli.read_text(encoding="utf-8"),
+                "#!/bin/sh\n"
+                'exec "/Applications/Social Auto Upload.app/Contents/MacOS/sau" "$@"\n',
             )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and shutil.which("pkgbuild")
+        and shutil.which("productbuild")
+        and shutil.which("pkgutil"),
+        "native macOS package inspection requires pkgbuild/productbuild/pkgutil",
+    )
+    def test_macos_postinstall_never_follows_target_components_or_replaces_foreign_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, postinstall = self._build_and_expand_native_fixture(root)
+
+            for component in ("usr", "usr/local", "usr/local/bin"):
+                with self.subTest(component=component):
+                    suffix = component.replace("/", "-")
+                    target = root / f"target-{suffix}"
+                    outside = root / f"outside-{suffix}"
+                    target.mkdir()
+                    if component == "usr":
+                        (outside / "local/bin").mkdir(parents=True)
+                        (target / "usr").symlink_to(outside, target_is_directory=True)
+                        escaped_cli = outside / "local/bin/sau"
+                    elif component == "usr/local":
+                        (target / "usr").mkdir()
+                        (outside / "bin").mkdir(parents=True)
+                        (target / "usr/local").symlink_to(outside, target_is_directory=True)
+                        escaped_cli = outside / "bin/sau"
+                    else:
+                        (target / "usr/local").mkdir(parents=True)
+                        outside.mkdir()
+                        (target / "usr/local/bin").symlink_to(outside, target_is_directory=True)
+                        escaped_cli = outside / "sau"
+                    result = subprocess.run(
+                        [str(postinstall), "package", "1.0", str(target)],
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(escaped_cli.exists())
+                    self.assertFalse(escaped_cli.is_symlink())
+
+            expected_self_target = "/Applications/Social Auto Upload.app/Contents/MacOS/sau"
+            link_cases = (
+                ("foreign-existing", str(root / "foreign-target")),
+                ("foreign-broken", "/not/a/social-auto-upload/target"),
+                ("expected-self", expected_self_target),
+            )
+            (root / "foreign-target").write_text("foreign-content", encoding="utf-8")
+            for name, link_target in link_cases:
+                with self.subTest(existing_link=name):
+                    target = root / f"target-link-{name}"
+                    cli_directory = target / "usr/local/bin"
+                    cli_directory.mkdir(parents=True)
+                    cli = cli_directory / "sau"
+                    cli.symlink_to(link_target)
+                    result = subprocess.run(
+                        [str(postinstall), "package", "1.0", str(target)],
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(cli.is_symlink())
+                    self.assertEqual(os.readlink(cli), link_target)
+            self.assertEqual((root / "foreign-target").read_text(encoding="utf-8"), "foreign-content")
+
+            target = root / "target-regular"
+            cli_directory = target / "usr/local/bin"
+            cli_directory.mkdir(parents=True)
+            cli = cli_directory / "sau"
+            cli.write_text("existing-command", encoding="utf-8")
+            result = subprocess.run(
+                [str(postinstall), "package", "1.0", str(target)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(cli.read_text(encoding="utf-8"), "existing-command")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and shutil.which("ditto")
+        and shutil.which("pkgbuild")
+        and shutil.which("productbuild"),
+        "native macOS package assembly requires ditto/pkgbuild/productbuild",
+    )
+    def test_macos_package_output_is_atomic_and_failed_build_preserves_existing_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            x86, arm = self._make_native_payloads(root)
+            output = root / "release"
+            output.mkdir()
+            package = output / "SocialAutoUpload-macOS-Universal.pkg"
+            sentinel = b"previous-good-package"
+            package.write_bytes(sentinel)
+
+            fake_tools = root / "fake-tools"
+            fake_tools.mkdir()
+            fake_productbuild = fake_tools / "productbuild"
+            fake_productbuild.write_text(
+                "#!/bin/sh\n"
+                "for output do :; done\n"
+                "printf '%s' 'partial-broken-package' >\"$output\"\n"
+                "exit 23\n",
+                encoding="utf-8",
+            )
+            fake_productbuild.chmod(0o755)
+            failed = subprocess.run(
+                ["bash", str(self.build_script), str(x86), str(arm), str(output)],
+                text=True,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_tools}:{os.environ['PATH']}",
+                    "SAU_PYTHON": sys.executable,
+                },
+            )
+            self.assertEqual(failed.returncode, 23)
+            self.assertEqual(package.read_bytes(), sentinel)
+            self.assertEqual(list(output.glob(".SocialAutoUpload-macOS-Universal.*")), [])
+
+            fake_productbuild.write_text(
+                "#!/bin/sh\n"
+                "for output do :; done\n"
+                "ln -s '/tmp/not-a-package' \"$output\"\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_productbuild.chmod(0o755)
+            symlink_result = subprocess.run(
+                ["bash", str(self.build_script), str(x86), str(arm), str(output)],
+                text=True,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_tools}:{os.environ['PATH']}",
+                    "SAU_PYTHON": sys.executable,
+                },
+            )
+            self.assertNotEqual(symlink_result.returncode, 0)
+            self.assertIn("regular package", symlink_result.stderr)
+            self.assertEqual(package.read_bytes(), sentinel)
+            self.assertEqual(list(output.glob(".SocialAutoUpload-macOS-Universal.*")), [])
+
+            succeeded = subprocess.run(
+                ["bash", str(self.build_script), str(x86), str(arm), str(output)],
+                text=True,
+                capture_output=True,
+                env={**os.environ, "SAU_PYTHON": sys.executable},
+            )
+            self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+            self.assertTrue(package.is_file())
+            self.assertFalse(package.is_symlink())
+            self.assertNotEqual(package.read_bytes(), sentinel)
+            self.assertEqual(list(output.glob(".SocialAutoUpload-macOS-Universal.*")), [])
 
 
 if __name__ == "__main__":
