@@ -46,8 +46,18 @@ def create_logger(log_name: str, file_path: str):
 
 # Remove all existing handlers
 logger.remove()
-# Add a standard console handler
-logger.add(sys.stdout, colorize=True, format=log_formatter)
+# Windowed Windows executables intentionally have no standard streams. File
+# handlers below remain available, while CLI processes retain colored output.
+console_stream = next(
+    (
+        stream
+        for stream in (sys.stdout, sys.stderr)
+        if callable(getattr(stream, "write", None))
+    ),
+    None,
+)
+if console_stream is not None:
+    logger.add(console_stream, colorize=True, format=log_formatter)
 
 douyin_logger = create_logger('douyin', 'logs/douyin.log')
 tencent_logger = create_logger('tencent', 'logs/tencent.log')
