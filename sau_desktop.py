@@ -35,6 +35,28 @@ def _exception_category(error: BaseException) -> str:
     return name[:64]
 
 
+def _exception_location(error: BaseException) -> str:
+    """Return only traceback code identity, never exception text or local values."""
+    traceback = error.__traceback__
+    if traceback is None:
+        return "unknown:unknown:0"
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    frame = traceback.tb_frame
+
+    def safe_identifier(value: object) -> str:
+        cleaned = "".join(
+            character
+            for character in str(value)
+            if character.isalnum() or character in "._<>"
+        )
+        return cleaned[:128] or "unknown"
+
+    module = safe_identifier(frame.f_globals.get("__name__", "unknown"))
+    function = safe_identifier(frame.f_code.co_name)
+    return f"{module}:{function}:{int(traceback.tb_lineno)}"
+
+
 class _DesktopStatusReporter:
     """Optional no-secret startup handshake for native smoke verification."""
 
@@ -322,7 +344,10 @@ def main() -> None:
             if server is not None:
                 server.raise_if_failed()
     except BaseException as error:
-        status.emit("error", _exception_category(error))
+        status.emit(
+            "error",
+            f"{_exception_category(error)} {_exception_location(error)}",
+        )
         raise
     finally:
         status.emit("stopped")

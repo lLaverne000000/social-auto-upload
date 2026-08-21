@@ -228,6 +228,20 @@ class DesktopLauncherTests(unittest.TestCase):
         self.assertNotIn("/Users/operator", rendered_log)
         self.assertIn("RuntimeError", rendered_log)
 
+    def test_exception_location_reports_code_identity_without_message_or_path(self):
+        try:
+            raise TypeError("secret-token C:\\Users\\operator\\private")
+        except TypeError as error:
+            location = sau_desktop._exception_location(error)
+
+        self.assertIn("test_desktop_launcher", location)
+        self.assertIn(
+            "test_exception_location_reports_code_identity_without_message_or_path",
+            location,
+        )
+        self.assertNotIn("secret-token", location)
+        self.assertNotIn("C:\\Users", location)
+
     def test_thread_start_failure_closes_bound_server(self):
         raw_server = Mock(server_port=49152)
         thread = Mock()
