@@ -89,19 +89,17 @@ begin
   end;
 end;
 
-function RemovePathEntry(const PathValue, Entry: String): String;
+function FindLastOwnedSegment(const PathValue, Entry: String): Integer;
 var
   Remaining: String;
   Segment: String;
   Separator: Integer;
   HasMore: Boolean;
-  FirstSegment: Boolean;
-  Removed: Boolean;
+  SegmentIndex: Integer;
 begin
-  Result := '';
+  Result := -1;
   Remaining := PathValue;
-  FirstSegment := True;
-  Removed := False;
+  SegmentIndex := 0;
   while True do
   begin
     Separator := Pos(';', Remaining);
@@ -116,9 +114,51 @@ begin
       Segment := Remaining;
       Remaining := '';
     end;
-    if (not Removed) and
-       (CompareText(NormalizePathEntry(Segment), NormalizePathEntry(Entry)) = 0) then
-      Removed := True
+    if CompareText(Segment, Entry) = 0 then
+      Result := SegmentIndex;
+    SegmentIndex := SegmentIndex + 1;
+    if not HasMore then
+      Break;
+  end;
+end;
+
+function RemovePathEntry(const PathValue, Entry: String): String;
+var
+  Remaining: String;
+  Segment: String;
+  Separator: Integer;
+  HasMore: Boolean;
+  FirstSegment: Boolean;
+  SegmentIndex: Integer;
+  LastOwnedSegment: Integer;
+begin
+  LastOwnedSegment := FindLastOwnedSegment(PathValue, Entry);
+  if LastOwnedSegment < 0 then
+  begin
+    Result := PathValue;
+    Exit;
+  end;
+  Result := '';
+  Remaining := PathValue;
+  FirstSegment := True;
+  SegmentIndex := 0;
+  while True do
+  begin
+    Separator := Pos(';', Remaining);
+    HasMore := Separator > 0;
+    if HasMore then
+    begin
+      Segment := Copy(Remaining, 1, Separator - 1);
+      Delete(Remaining, 1, Separator);
+    end
+    else
+    begin
+      Segment := Remaining;
+      Remaining := '';
+    end;
+    if SegmentIndex = LastOwnedSegment then
+    begin
+    end
     else
     begin
       if not FirstSegment then
@@ -126,6 +166,7 @@ begin
       Result := Result + Segment;
       FirstSegment := False;
     end;
+    SegmentIndex := SegmentIndex + 1;
     if not HasMore then
       Break;
   end;

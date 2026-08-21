@@ -38,6 +38,27 @@ function Get-ContainedPath {
     return $FullPath
 }
 
+function Get-PathEntryNoFollow {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $FullPath = [IO.Path]::GetFullPath($Path)
+    $ParentPath = Split-Path -LiteralPath $FullPath -Parent
+    $LeafName = Split-Path -LiteralPath $FullPath -Leaf
+    if ([string]::IsNullOrEmpty($ParentPath) -or [string]::IsNullOrEmpty($LeafName)) {
+        throw "Cannot enumerate filesystem entry without a parent and leaf: $FullPath"
+    }
+    $Matches = @(
+        Get-ChildItem -LiteralPath $ParentPath -Force -ErrorAction Stop |
+            Where-Object { [string]::Equals($_.Name, $LeafName, [StringComparison]::OrdinalIgnoreCase) }
+    )
+    if ($Matches.Count -gt 1) {
+        throw "Ambiguous filesystem entries for path: $FullPath"
+    }
+    if ($Matches.Count -eq 0) {
+        return $null
+    }
+    return $Matches[0]
+}
+
 function Assert-NoReparseAncestors {
     param([Parameter(Mandatory = $true)][string]$Path)
     $FullPath = [IO.Path]::GetFullPath($Path)
@@ -55,7 +76,7 @@ function Assert-NoReparseAncestors {
             continue
         }
         $CurrentPath = Join-Path $CurrentPath $Component
-        $CurrentItem = Get-Item -LiteralPath $CurrentPath -Force -ErrorAction SilentlyContinue
+        $CurrentItem = Get-PathEntryNoFollow -Path $CurrentPath
         if ($null -eq $CurrentItem) {
             break
         }
@@ -78,8 +99,8 @@ function Remove-ContainedDirectory {
         throw "Refusing to clean a path outside the repository: $Path"
     }
     Assert-NoReparseAncestors -Path $Path
-    if (Test-Path -LiteralPath $Path) {
-        $Item = Get-Item -LiteralPath $Path -Force
+    $Item = Get-PathEntryNoFollow -Path $Path
+    if ($null -ne $Item) {
         if (-not $Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "Refusing to clean a non-directory or reparse point: $Path"
         }
@@ -90,10 +111,10 @@ function Remove-ContainedDirectory {
 function Remove-TemporaryDirectoryStrict {
     param([Parameter(Mandatory = $true)][string]$Path)
     Assert-NoReparseAncestors -Path $Path
-    if (Test-Path -LiteralPath $Path) {
+    if ($null -ne (Get-PathEntryNoFollow -Path $Path)) {
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
-    if (Test-Path -LiteralPath $Path) {
+    if ($null -ne (Get-PathEntryNoFollow -Path $Path)) {
         throw "Temporary output cleanup did not complete: $Path"
     }
 }
@@ -105,10 +126,10 @@ function Remove-PathNonFatal {
     }
     try {
         Assert-NoReparseAncestors -Path $Path
-        if (Test-Path -LiteralPath $Path) {
+        if ($null -ne (Get-PathEntryNoFollow -Path $Path)) {
             Remove-Item -LiteralPath $Path -Recurse -Force
         }
-        if (Test-Path -LiteralPath $Path) {
+        if ($null -ne (Get-PathEntryNoFollow -Path $Path)) {
             throw "cleanup left the path in place"
         }
     } catch {
@@ -119,16 +140,29 @@ function Remove-PathNonFatal {
 function Remove-PublishedFileStrict {
     param([Parameter(Mandatory = $true)][string]$Path)
     Assert-NoReparseAncestors -Path $Path
-    if (Test-Path -LiteralPath $Path) {
-        $Item = Get-Item -LiteralPath $Path -Force
+    $Item = Get-PathEntryNoFollow -Path $Path
+    if ($null -ne $Item) {
         if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "Rollback target is not a regular file: $Path"
         }
         Remove-Item -LiteralPath $Path -Force
     }
-    if (Test-Path -LiteralPath $Path) {
+    if ($null -ne (Get-PathEntryNoFollow -Path $Path)) {
         throw "Rollback could not remove newly published file: $Path"
     }
+}
+
+function Assert-PublicArtifactState {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Assert-NoReparseAncestors -Path $Path
+    $Entry = Get-PathEntryNoFollow -Path $Path
+    if ($null -eq $Entry) {
+        return $false
+    }
+    if ($Entry.PSIsContainer -or ($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Public artifact path is not a regular non-reparse file: $Path"
+    }
+    return $true
 }
 
 function Publish-ArtifactPair {
@@ -136,13 +170,24 @@ function Publish-ArtifactPair {
         [Parameter(Mandatory = $true)][string]$StagedInstaller,
         [Parameter(Mandatory = $true)][string]$StagedChecksum,
         [Parameter(Mandatory = $true)][string]$OutputInstaller,
-        [Parameter(Mandatory = $true)][string]$OutputChecksum
+        [Parameter(Mandatory = $true)][string]$OutputChecksum,
+        [Parameter(Mandatory = $true)][string]$TransactionDirectory,
+        [Parameter(Mandatory = $true)][ref]$KeepTransactionForRecovery
     )
-    $TransactionId = [guid]::NewGuid().ToString('N')
-    $InstallerBackup = Join-Path (Split-Path -LiteralPath $OutputInstaller -Parent) (".$([IO.Path]::GetFileName($OutputInstaller)).backup-$TransactionId")
-    $ChecksumBackup = Join-Path (Split-Path -LiteralPath $OutputChecksum -Parent) (".$([IO.Path]::GetFileName($OutputChecksum)).backup-$TransactionId")
-    $InstallerExisted = Test-Path -LiteralPath $OutputInstaller -PathType Leaf
-    $ChecksumExisted = Test-Path -LiteralPath $OutputChecksum -PathType Leaf
+    $InstallerBackup = Join-Path $TransactionDirectory 'previous-installer.backup'
+    $ChecksumBackup = Join-Path $TransactionDirectory 'previous-checksum.backup'
+    $InstallerEntry = Get-PathEntryNoFollow -Path $OutputInstaller
+    $ChecksumEntry = Get-PathEntryNoFollow -Path $OutputChecksum
+    if (($null -ne $InstallerEntry) -and
+        ($InstallerEntry.PSIsContainer -or ($InstallerEntry.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+        throw "Public installer is not a regular non-reparse file: $OutputInstaller"
+    }
+    if (($null -ne $ChecksumEntry) -and
+        ($ChecksumEntry.PSIsContainer -or ($ChecksumEntry.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+        throw "Public checksum is not a regular non-reparse file: $OutputChecksum"
+    }
+    $InstallerExisted = $null -ne $InstallerEntry
+    $ChecksumExisted = $null -ne $ChecksumEntry
     $PublicationStarted = $false
     $RollbackFailed = $false
     try {
@@ -164,6 +209,13 @@ function Publish-ArtifactPair {
             Move-Item -LiteralPath $StagedChecksum -Destination $OutputChecksum
         }
 
+        $PublishedInstallerEntry = Get-PathEntryNoFollow -Path $OutputInstaller
+        $PublishedChecksumEntry = Get-PathEntryNoFollow -Path $OutputChecksum
+        if (($null -eq $PublishedInstallerEntry) -or ($null -eq $PublishedChecksumEntry) -or
+            ($PublishedInstallerEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            ($PublishedChecksumEntry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Published installer/checksum pair is missing or became a reparse point.'
+        }
         $PublishedHash = (Get-FileHash -LiteralPath $OutputInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
         $PublishedChecksum = Get-Content -LiteralPath $OutputChecksum -Raw
         $ExpectedChecksum = $PublishedHash + "  $([IO.Path]::GetFileName($OutputInstaller))`r`n"
@@ -174,26 +226,37 @@ function Publish-ArtifactPair {
         $PublicationError = $_
         if ($PublicationStarted) {
             try {
+                $RollbackInstallerEntry = Get-PathEntryNoFollow -Path $OutputInstaller
+                $RollbackChecksumEntry = Get-PathEntryNoFollow -Path $OutputChecksum
                 if ($InstallerExisted) {
-                    if (Test-Path -LiteralPath $OutputInstaller) {
+                    if ($null -ne $RollbackInstallerEntry) {
+                        if ($RollbackInstallerEntry.PSIsContainer -or
+                            ($RollbackInstallerEntry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                            throw "Rollback installer destination is unsafe: $OutputInstaller"
+                        }
                         [IO.File]::Replace($InstallerBackup, $OutputInstaller, $null, $true)
                     } else {
                         Move-Item -LiteralPath $InstallerBackup -Destination $OutputInstaller
                     }
-                } elseif (Test-Path -LiteralPath $OutputInstaller) {
+                } elseif ($null -ne $RollbackInstallerEntry) {
                     Remove-PublishedFileStrict -Path $OutputInstaller
                 }
                 if ($ChecksumExisted) {
-                    if (Test-Path -LiteralPath $OutputChecksum) {
+                    if ($null -ne $RollbackChecksumEntry) {
+                        if ($RollbackChecksumEntry.PSIsContainer -or
+                            ($RollbackChecksumEntry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                            throw "Rollback checksum destination is unsafe: $OutputChecksum"
+                        }
                         [IO.File]::Replace($ChecksumBackup, $OutputChecksum, $null, $true)
                     } else {
                         Move-Item -LiteralPath $ChecksumBackup -Destination $OutputChecksum
                     }
-                } elseif (Test-Path -LiteralPath $OutputChecksum) {
+                } elseif ($null -ne $RollbackChecksumEntry) {
                     Remove-PublishedFileStrict -Path $OutputChecksum
                 }
             } catch {
                 $RollbackFailed = $true
+                $KeepTransactionForRecovery.Value = $true
                 throw "Artifact-pair publication failed and Rollback failed; backups were preserved: $($PublicationError.Exception.Message)"
             }
         }
@@ -243,6 +306,7 @@ $FrontendNodeModules = Get-SafeMutablePath 'sau_frontend\node_modules'
 $BrowserStage = Get-SafeMutablePath 'packaging\browser-stage'
 $BuildDirectory = Get-SafeMutablePath 'build'
 $PyInstallerWork = Get-SafeMutablePath 'build\pyinstaller-windows-x64'
+$ReleaseTransactionsDirectory = Get-SafeMutablePath 'build\release-transactions'
 $DistDirectory = Get-SafeMutablePath 'dist'
 $PayloadDirectory = Get-SafeMutablePath 'dist\SocialAutoUpload'
 $SpecPath = (Resolve-Path -LiteralPath (Get-ContainedPath 'packaging\pyinstaller\social_auto_upload.spec')).Path
@@ -296,7 +360,7 @@ Invoke-NativeCommand -FilePath $PythonPath -ArgumentList @(
 )
 
 Assert-NoReparseAncestors -Path $ReleaseDirectory
-if (-not (Test-Path -LiteralPath $ReleaseDirectory)) {
+if ($null -eq (Get-PathEntryNoFollow -Path $ReleaseDirectory)) {
     New-Item -ItemType Directory -Path $ReleaseDirectory | Out-Null
 }
 Assert-NoReparseAncestors -Path $ReleaseDirectory
@@ -304,33 +368,31 @@ $ReleaseItem = Get-Item -LiteralPath $ReleaseDirectory -Force
 if (-not $ReleaseItem.PSIsContainer -or ($ReleaseItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
     throw "Release path must be a real directory: $ReleaseDirectory"
 }
-if (Test-Path -LiteralPath $OutputInstaller) {
-    $ExistingInstaller = Get-Item -LiteralPath $OutputInstaller -Force
-    if ($ExistingInstaller.PSIsContainer -or ($ExistingInstaller.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "Refusing to replace a non-file or reparse point: $OutputInstaller"
-    }
+if ($null -eq (Get-PathEntryNoFollow -Path $ReleaseTransactionsDirectory)) {
+    New-Item -ItemType Directory -Path $ReleaseTransactionsDirectory | Out-Null
 }
-if (Test-Path -LiteralPath $OutputChecksum) {
-    $ExistingChecksum = Get-Item -LiteralPath $OutputChecksum -Force
-    if ($ExistingChecksum.PSIsContainer -or ($ExistingChecksum.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "Refusing to replace a non-file or reparse point: $OutputChecksum"
-    }
-}
+Assert-NoReparseAncestors -Path $ReleaseTransactionsDirectory
+$null = Assert-PublicArtifactState -Path $OutputInstaller
+$null = Assert-PublicArtifactState -Path $OutputChecksum
 
 $OutputTransactionId = [guid]::NewGuid().ToString('N')
-$TemporaryOutputDirectory = Join-Path $ReleaseDirectory ('.SocialAutoUpload-Windows-x64-Setup.' + $OutputTransactionId)
-$TemporaryInstaller = Join-Path $TemporaryOutputDirectory $InstallerName
-$TemporaryChecksum = Join-Path $TemporaryOutputDirectory $ChecksumName
-$StagedInstaller = Join-Path $ReleaseDirectory (".$InstallerName.publish-$OutputTransactionId")
-$StagedChecksum = Join-Path $ReleaseDirectory (".$ChecksumName.publish-$OutputTransactionId")
-Assert-NoReparseAncestors -Path $TemporaryOutputDirectory
+$TransactionDirectory = Join-Path $ReleaseTransactionsDirectory $OutputTransactionId
+$InnoOutputDirectory = Join-Path $TransactionDirectory 'inno-output'
+$TemporaryInstaller = Join-Path $InnoOutputDirectory $InstallerName
+$TemporaryChecksum = Join-Path $InnoOutputDirectory $ChecksumName
+$StagedInstaller = Join-Path $TransactionDirectory 'staged-installer.exe'
+$StagedChecksum = Join-Path $TransactionDirectory 'staged-installer.sha256'
+Assert-NoReparseAncestors -Path $TransactionDirectory
+New-Item -ItemType Directory -Path $TransactionDirectory | Out-Null
+Assert-NoReparseAncestors -Path $InnoOutputDirectory
 Assert-NoReparseAncestors -Path $StagedInstaller
 Assert-NoReparseAncestors -Path $StagedChecksum
-New-Item -ItemType Directory -Path $TemporaryOutputDirectory | Out-Null
+New-Item -ItemType Directory -Path $InnoOutputDirectory | Out-Null
+$KeepTransactionForRecovery = $false
 try {
     Invoke-NativeCommand -FilePath $InnoCompilerPath -ArgumentList @(
         "/DPayloadDir=$PayloadDirectory",
-        "/DOutputDir=$TemporaryOutputDirectory",
+        "/DOutputDir=$InnoOutputDirectory",
         '/DAppVersion=0.1.0',
         $IssPath
     )
@@ -354,16 +416,20 @@ try {
 
     Move-Item -LiteralPath $TemporaryInstaller -Destination $StagedInstaller
     Move-Item -LiteralPath $TemporaryChecksum -Destination $StagedChecksum
-    Remove-TemporaryDirectoryStrict -Path $TemporaryOutputDirectory
+    Remove-TemporaryDirectoryStrict -Path $InnoOutputDirectory
     Publish-ArtifactPair `
         -StagedInstaller $StagedInstaller `
         -StagedChecksum $StagedChecksum `
         -OutputInstaller $OutputInstaller `
-        -OutputChecksum $OutputChecksum
+        -OutputChecksum $OutputChecksum `
+        -TransactionDirectory $TransactionDirectory `
+        -KeepTransactionForRecovery ([ref]$KeepTransactionForRecovery)
 } finally {
-    Remove-PathNonFatal -Path $TemporaryOutputDirectory
-    Remove-PathNonFatal -Path $StagedInstaller
-    Remove-PathNonFatal -Path $StagedChecksum
+    if ($KeepTransactionForRecovery) {
+        Write-Warning "Rollback recovery files were preserved in $TransactionDirectory"
+    } else {
+        Remove-PathNonFatal -Path $TransactionDirectory
+    }
 }
 
 Write-Host "Created Windows x64 installer: $OutputInstaller"

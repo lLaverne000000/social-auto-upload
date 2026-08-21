@@ -549,7 +549,7 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertIn("function Assert-NoReparseAncestors", source)
         self.assertIn("[IO.FileAttributes]::ReparsePoint", source)
         helper = source[source.index("function Assert-NoReparseAncestors"):source.index("function Get-SafeMutablePath")]
-        self.assertIn("Get-Item -LiteralPath $CurrentPath -Force -ErrorAction SilentlyContinue", helper)
+        self.assertIn("Get-PathEntryNoFollow -Path $CurrentPath", helper)
         self.assertNotIn("Test-Path -LiteralPath $CurrentPath", helper)
         for relative_path in (
             r"sau_frontend\dist",
@@ -610,6 +610,54 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertIn('"  $InstallerName`r`n"', source)
         self.assertIn("Get-Content -LiteralPath $OutputChecksum -Raw", source)
         self.assertIn("Get-FileHash -LiteralPath $OutputInstaller -Algorithm SHA256", source)
+
+    def test_windows_path_removes_last_case_insensitive_raw_owned_segment_only(self):
+        source = self.installer_source.read_text(encoding="utf-8")
+        find_start = source.index("function FindLastOwnedSegment")
+        remove_start = source.index("function RemovePathEntry", find_start)
+        add_start = source.index("procedure AddUserPath", remove_start)
+        path_functions = source[find_start:add_start]
+        self.assertIn("LastOwnedSegment", path_functions)
+        self.assertIn("CompareText(Segment, Entry) = 0", path_functions)
+        self.assertNotIn("NormalizePathEntry(Segment)", path_functions)
+        self.assertIn("SegmentIndex = LastOwnedSegment", path_functions)
+
+        fixture = ['"C:\\App\\"', "A", r"C:\App"]
+        owned = r"C:\App"
+        last_owned = max(index for index, segment in enumerate(fixture) if segment.casefold() == owned.casefold())
+        rebuilt = ";".join(segment for index, segment in enumerate(fixture) if index != last_owned)
+        self.assertEqual(rebuilt, '"C:\\App\\";A')
+
+    def test_windows_builder_detects_dangling_public_reparse_entries_without_test_path(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        helper_start = source.index("function Get-PathEntryNoFollow")
+        helper_end = source.index("function Assert-NoReparseAncestors", helper_start)
+        helper = source[helper_start:helper_end]
+        self.assertIn("Get-ChildItem -LiteralPath $ParentPath -Force", helper)
+        self.assertNotIn("Test-Path", helper)
+        public_start = source.index("function Assert-PublicArtifactState")
+        public_end = source.index("function Publish-ArtifactPair", public_start)
+        public_helper = source[public_start:public_end]
+        self.assertIn("Get-PathEntryNoFollow", public_helper)
+        publish = source[source.index("function Publish-ArtifactPair"):source.index("if ([string]::IsNullOrWhiteSpace($BrowserSource))")]
+        self.assertGreaterEqual(publish.count("Get-PathEntryNoFollow"), 6)
+        self.assertNotIn("Test-Path -LiteralPath $OutputInstaller", publish)
+        self.assertNotIn("Test-Path -LiteralPath $OutputChecksum", publish)
+
+    def test_windows_release_transactions_never_stage_private_files_in_release(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        self.assertIn("Get-SafeMutablePath 'build\\release-transactions'", source)
+        self.assertIn("$TransactionDirectory", source)
+        self.assertIn("$InnoOutputDirectory", source)
+        self.assertIn("Remove-TemporaryDirectoryStrict -Path $InnoOutputDirectory", source)
+        self.assertIn("Remove-PathNonFatal -Path $TransactionDirectory", source)
+        self.assertIn("$KeepTransactionForRecovery", source)
+        self.assertIn("if ($KeepTransactionForRecovery)", source)
+        publish = source[source.index("function Publish-ArtifactPair"):source.index("if ([string]::IsNullOrWhiteSpace($BrowserSource))")]
+        self.assertIn("[string]$TransactionDirectory", publish)
+        self.assertIn("Join-Path $TransactionDirectory", publish)
+        self.assertNotIn("Join-Path (Split-Path -LiteralPath $OutputInstaller -Parent)", publish)
+        self.assertNotIn(".publish-", source)
 
 
 class MacOSPackagingTests(unittest.TestCase):
