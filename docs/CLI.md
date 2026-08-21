@@ -46,7 +46,9 @@ Mac 架构选择，不依赖 Rosetta 冒充另一架构。
 
 Windows x64 默认按当前用户安装到
 `%LOCALAPPDATA%\Programs\SocialAutoUpload`。用户 PATH 选项默认不勾选；未加入 PATH
-时，从开始菜单的 `Social Auto Upload Command Line` 快捷方式启动，或执行：
+时，从开始菜单的 `Social Auto Upload Command Line` 快捷方式启动。该快捷方式会先
+运行 `sau.exe --help`，然后把命令提示符保持在应用目录，可以继续输入
+`sau.exe <platform> <action> ...`。也可以在 PowerShell 中直接执行：
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\SocialAutoUpload\sau.exe" --help

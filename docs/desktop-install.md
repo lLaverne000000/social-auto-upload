@@ -80,10 +80,11 @@ SmartScreen 提示中选择“更多信息”，核对文件名，再选择“�
 SmartScreen。Windows 11 的 Smart App Control 或组织策略可能完全禁止未签名应用且
 不显示继续选项；这种情况应使用签名版本或联系设备管理员。参见
 [Microsoft SmartScreen reputation 说明](https://learn.microsoft.com/windows/apps/package-and-deploy/smartscreen-reputation)
-和 [Windows 应用与浏览器控制说明](https://support.microsoft.com/windows/security/windows-security-app-browser-control-in-the-windows-security-app)。
+和 [Windows 应用与浏览器控制说明](https://support.microsoft.com/en-us/Windows/Security/windows-security/app-browser-control-in-the-windows-security-app)。
 
 从开始菜单打开 `Social Auto Upload` 使用 GUI。CLI 可以从“Social Auto Upload
-Command Line”快捷方式启动，也可以在 PowerShell 中直接执行：
+Command Line”快捷方式启动；该快捷方式先显示 `sau.exe --help`，再把命令提示符保持
+在应用目录中，可以继续输入 `sau.exe ...`。也可以在 PowerShell 中直接执行：
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\SocialAutoUpload\sau.exe" --help
@@ -118,20 +119,38 @@ GUI 和 CLI 经过同一个发布服务，不能绕过并发锁、冷却、重�
 
 ## CLI 使用
 
-安装包中的 CLI 与 GUI 共用版本、配置、账号目录、浏览器和治理代码。例如：
+安装包中的 CLI 与 GUI 共用版本、配置、账号目录、浏览器和治理代码。
+
+macOS Bash 完整示例：
 
 ```bash
-sau douyin login --account creator
-sau douyin check --account creator
-sau douyin upload-video --account creator --file /absolute/path/demo.mp4 \
+"/Applications/Social Auto Upload.app/Contents/MacOS/sau" douyin login \
+  --account creator
+"/Applications/Social Auto Upload.app/Contents/MacOS/sau" douyin check \
+  --account creator
+"/Applications/Social Auto Upload.app/Contents/MacOS/sau" douyin upload-video \
+  --account creator --file "/Users/creator/Movies/demo.mp4" \
   --title "示例标题" --desc "示例简介" --declaration none
-sau safety status --platform douyin --account creator --json
+"/Applications/Social Auto Upload.app/Contents/MacOS/sau" safety status \
+  --platform douyin --account creator --json
 ```
 
-Windows 未加入 PATH 时，把示例开头的 `sau` 替换为
-`& "$env:LOCALAPPDATA\Programs\SocialAutoUpload\sau.exe"`；macOS 找不到 wrapper 时，
-替换为 `"/Applications/Social Auto Upload.app/Contents/MacOS/sau"`。完整平台和参数见
-[CLI 使用说明](./CLI.md)。
+Windows PowerShell 完整示例：
+
+```powershell
+$Sau = Join-Path $env:LOCALAPPDATA 'Programs\SocialAutoUpload\sau.exe'
+& $Sau douyin login --account creator
+& $Sau douyin check --account creator
+& $Sau douyin upload-video `
+  --account creator `
+  --file 'C:\Users\creator\Videos\demo.mp4' `
+  --title '示例标题' `
+  --desc '示例简介' `
+  --declaration none
+& $Sau safety status --platform douyin --account creator --json
+```
+
+完整平台和参数见 [CLI 使用说明](./CLI.md)。
 
 ## 验证离线浏览器载荷
 
@@ -165,11 +184,20 @@ macOS：
 2. 如果 `/usr/local/bin/sau` 确认是本安装包创建的 CLI wrapper，再删除它；不要删除
    其他软件创建的同名命令。
 
-可以先核对 wrapper 的固定执行行；只有第一条命令完整匹配时才执行第二条：
+下面的条件同时要求它是普通文件、不是 symlink，并逐字节比较包含 shebang 和结尾换行
+在内的完整内容；只有与本安装包 wrapper 完全一致时才删除：
 
 ```bash
-grep -Fx 'exec "/Applications/Social Auto Upload.app/Contents/MacOS/sau" "$@"' /usr/local/bin/sau
-sudo rm /usr/local/bin/sau
+if [ -f /usr/local/bin/sau ] && [ ! -L /usr/local/bin/sau ] &&
+   cmp -s /usr/local/bin/sau - <<'SAU_WRAPPER'
+#!/bin/sh
+exec "/Applications/Social Auto Upload.app/Contents/MacOS/sau" "$@"
+SAU_WRAPPER
+then
+    sudo rm /usr/local/bin/sau
+else
+    printf '%s\n' '未删除：/usr/local/bin/sau 不是本安装包的完整 wrapper。' >&2
+fi
 ```
 
 Windows：进入“设置 → 应用 → 已安装的应用”，找到 `Social Auto Upload` 并选择

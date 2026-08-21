@@ -44,7 +44,7 @@ Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 [Icons]
 Name: "{autodesktop}\Social Auto Upload"; Filename: "{app}\SocialAutoUpload.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{group}\Social Auto Upload"; Filename: "{app}\SocialAutoUpload.exe"; WorkingDir: "{app}"
-Name: "{group}\Social Auto Upload Command Line"; Filename: "{app}\sau.exe"; WorkingDir: "{app}"
+Name: "{group}\Social Auto Upload Command Line"; Filename: "{cmd}"; Parameters: "/K """"{app}\sau.exe"" --help"""; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\SocialAutoUpload.exe"; Description: "Launch Social Auto Upload"; Flags: nowait postinstall skipifsilent

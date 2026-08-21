@@ -484,17 +484,30 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertNotIn("https://", source.casefold())
         self.assertNotIn(r"{localappdata}\SocialAutoUpload", source)
 
-    def test_windows_installer_includes_verified_payload_and_all_shortcuts(self):
+    def test_windows_installer_includes_verified_payload_and_usable_shortcuts(self):
         self.assertTrue(self.installer_source.is_file(), "Windows Inno Setup definition must exist")
         source = self.installer_source.read_text(encoding="utf-8")
         self.assertIn(r'Source: "{#PayloadDir}\*"', source)
         self.assertIn("recursesubdirs", source)
         self.assertIn("createallsubdirs", source)
         self.assertIn(r'Filename: "{app}\SocialAutoUpload.exe"', source)
-        self.assertIn(r'Filename: "{app}\sau.exe"', source)
         self.assertIn(r'Name: "{autodesktop}\Social Auto Upload"', source)
         self.assertIn(r'Name: "{group}\Social Auto Upload"', source)
-        self.assertIn(r'Name: "{group}\Social Auto Upload Command Line"', source)
+        cli_shortcuts = [
+            line for line in source.splitlines()
+            if line.startswith(r'Name: "{group}\Social Auto Upload Command Line"')
+        ]
+        self.assertEqual(
+            cli_shortcuts,
+            [
+                r'Name: "{group}\Social Auto Upload Command Line"; Filename: "{cmd}"; '
+                r'Parameters: "/K """"{app}\sau.exe"" --help"""; WorkingDir: "{app}"'
+            ],
+        )
+        self.assertNotIn(
+            r'Name: "{group}\Social Auto Upload Command Line"; Filename: "{app}\sau.exe"',
+            source,
+        )
 
     def test_windows_path_task_is_unchecked_and_user_scoped_only(self):
         self.assertTrue(self.installer_source.is_file(), "Windows Inno Setup definition must exist")
