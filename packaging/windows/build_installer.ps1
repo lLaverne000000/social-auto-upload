@@ -38,17 +38,171 @@ function Get-ContainedPath {
     return $FullPath
 }
 
+function Assert-NoReparseAncestors {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $FullPath = [IO.Path]::GetFullPath($Path)
+    if (-not $FullPath.StartsWith($ProjectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Mutable path escapes the repository: $FullPath"
+    }
+    $RootItem = Get-Item -LiteralPath $ProjectRoot -Force
+    if (-not $RootItem.PSIsContainer -or ($RootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Repository root must be a real directory: $ProjectRoot"
+    }
+    $RelativePath = $FullPath.Substring($ProjectPrefix.Length)
+    $CurrentPath = $ProjectRoot
+    foreach ($Component in ($RelativePath -split '[\\/]')) {
+        if ([string]::IsNullOrEmpty($Component)) {
+            continue
+        }
+        $CurrentPath = Join-Path $CurrentPath $Component
+        $CurrentItem = Get-Item -LiteralPath $CurrentPath -Force -ErrorAction SilentlyContinue
+        if ($null -eq $CurrentItem) {
+            break
+        }
+        if ($CurrentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Mutable path contains a reparse-point ancestor: $CurrentPath"
+        }
+    }
+}
+
+function Get-SafeMutablePath {
+    param([Parameter(Mandatory = $true)][string]$RelativePath)
+    $FullPath = Get-ContainedPath $RelativePath
+    Assert-NoReparseAncestors -Path $FullPath
+    return $FullPath
+}
+
 function Remove-ContainedDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not $Path.StartsWith($ProjectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to clean a path outside the repository: $Path"
     }
+    Assert-NoReparseAncestors -Path $Path
     if (Test-Path -LiteralPath $Path) {
         $Item = Get-Item -LiteralPath $Path -Force
         if (-not $Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "Refusing to clean a non-directory or reparse point: $Path"
         }
         Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
+function Remove-TemporaryDirectoryStrict {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Assert-NoReparseAncestors -Path $Path
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $Path) {
+        throw "Temporary output cleanup did not complete: $Path"
+    }
+}
+
+function Remove-PathNonFatal {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+    try {
+        Assert-NoReparseAncestors -Path $Path
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        }
+        if (Test-Path -LiteralPath $Path) {
+            throw "cleanup left the path in place"
+        }
+    } catch {
+        Write-Warning "Non-fatal cleanup failure for $Path"
+    }
+}
+
+function Remove-PublishedFileStrict {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Assert-NoReparseAncestors -Path $Path
+    if (Test-Path -LiteralPath $Path) {
+        $Item = Get-Item -LiteralPath $Path -Force
+        if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Rollback target is not a regular file: $Path"
+        }
+        Remove-Item -LiteralPath $Path -Force
+    }
+    if (Test-Path -LiteralPath $Path) {
+        throw "Rollback could not remove newly published file: $Path"
+    }
+}
+
+function Publish-ArtifactPair {
+    param(
+        [Parameter(Mandatory = $true)][string]$StagedInstaller,
+        [Parameter(Mandatory = $true)][string]$StagedChecksum,
+        [Parameter(Mandatory = $true)][string]$OutputInstaller,
+        [Parameter(Mandatory = $true)][string]$OutputChecksum
+    )
+    $TransactionId = [guid]::NewGuid().ToString('N')
+    $InstallerBackup = Join-Path (Split-Path -LiteralPath $OutputInstaller -Parent) (".$([IO.Path]::GetFileName($OutputInstaller)).backup-$TransactionId")
+    $ChecksumBackup = Join-Path (Split-Path -LiteralPath $OutputChecksum -Parent) (".$([IO.Path]::GetFileName($OutputChecksum)).backup-$TransactionId")
+    $InstallerExisted = Test-Path -LiteralPath $OutputInstaller -PathType Leaf
+    $ChecksumExisted = Test-Path -LiteralPath $OutputChecksum -PathType Leaf
+    $PublicationStarted = $false
+    $RollbackFailed = $false
+    try {
+        if ($InstallerExisted) {
+            Copy-Item -LiteralPath $OutputInstaller -Destination $InstallerBackup
+        }
+        if ($ChecksumExisted) {
+            Copy-Item -LiteralPath $OutputChecksum -Destination $ChecksumBackup
+        }
+        $PublicationStarted = $true
+        if ($InstallerExisted) {
+            [IO.File]::Replace($StagedInstaller, $OutputInstaller, $null, $true)
+        } else {
+            Move-Item -LiteralPath $StagedInstaller -Destination $OutputInstaller
+        }
+        if ($ChecksumExisted) {
+            [IO.File]::Replace($StagedChecksum, $OutputChecksum, $null, $true)
+        } else {
+            Move-Item -LiteralPath $StagedChecksum -Destination $OutputChecksum
+        }
+
+        $PublishedHash = (Get-FileHash -LiteralPath $OutputInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+        $PublishedChecksum = Get-Content -LiteralPath $OutputChecksum -Raw
+        $ExpectedChecksum = $PublishedHash + "  $([IO.Path]::GetFileName($OutputInstaller))`r`n"
+        if ($PublishedChecksum -cne $ExpectedChecksum) {
+            throw 'Published installer/checksum pair failed its final hash self-check.'
+        }
+    } catch {
+        $PublicationError = $_
+        if ($PublicationStarted) {
+            try {
+                if ($InstallerExisted) {
+                    if (Test-Path -LiteralPath $OutputInstaller) {
+                        [IO.File]::Replace($InstallerBackup, $OutputInstaller, $null, $true)
+                    } else {
+                        Move-Item -LiteralPath $InstallerBackup -Destination $OutputInstaller
+                    }
+                } elseif (Test-Path -LiteralPath $OutputInstaller) {
+                    Remove-PublishedFileStrict -Path $OutputInstaller
+                }
+                if ($ChecksumExisted) {
+                    if (Test-Path -LiteralPath $OutputChecksum) {
+                        [IO.File]::Replace($ChecksumBackup, $OutputChecksum, $null, $true)
+                    } else {
+                        Move-Item -LiteralPath $ChecksumBackup -Destination $OutputChecksum
+                    }
+                } elseif (Test-Path -LiteralPath $OutputChecksum) {
+                    Remove-PublishedFileStrict -Path $OutputChecksum
+                }
+            } catch {
+                $RollbackFailed = $true
+                throw "Artifact-pair publication failed and Rollback failed; backups were preserved: $($PublicationError.Exception.Message)"
+            }
+        }
+        throw $PublicationError
+    } finally {
+        if (-not $RollbackFailed) {
+            Remove-PathNonFatal -Path $InstallerBackup
+            Remove-PathNonFatal -Path $ChecksumBackup
+        }
     }
 }
 
@@ -84,17 +238,23 @@ if ([string]::IsNullOrWhiteSpace($InnoCompiler)) {
 $InnoCompilerPath = (Resolve-Path -LiteralPath $InnoCompiler).Path
 
 $FrontendDirectory = Get-ContainedPath 'sau_frontend'
-$FrontendDist = Get-ContainedPath 'sau_frontend\dist'
-$BrowserStage = Get-ContainedPath 'packaging\browser-stage'
-$PyInstallerWork = Get-ContainedPath 'build\pyinstaller-windows-x64'
-$DistDirectory = Get-ContainedPath 'dist'
-$PayloadDirectory = Get-ContainedPath 'dist\SocialAutoUpload'
+$FrontendDist = Get-SafeMutablePath 'sau_frontend\dist'
+$FrontendNodeModules = Get-SafeMutablePath 'sau_frontend\node_modules'
+$BrowserStage = Get-SafeMutablePath 'packaging\browser-stage'
+$BuildDirectory = Get-SafeMutablePath 'build'
+$PyInstallerWork = Get-SafeMutablePath 'build\pyinstaller-windows-x64'
+$DistDirectory = Get-SafeMutablePath 'dist'
+$PayloadDirectory = Get-SafeMutablePath 'dist\SocialAutoUpload'
 $SpecPath = (Resolve-Path -LiteralPath (Get-ContainedPath 'packaging\pyinstaller\social_auto_upload.spec')).Path
 $IssPath = (Resolve-Path -LiteralPath (Get-ContainedPath 'packaging\windows\SocialAutoUpload.iss')).Path
-$ReleaseDirectory = Get-ContainedPath 'release'
+$ReleaseDirectory = Get-SafeMutablePath 'release'
 $InstallerName = 'SocialAutoUpload-Windows-x64-Setup.exe'
+$ChecksumName = "$InstallerName.sha256"
 $OutputInstaller = Join-Path $ReleaseDirectory $InstallerName
+$OutputChecksum = Join-Path $ReleaseDirectory $ChecksumName
 
+Assert-NoReparseAncestors -Path $FrontendNodeModules
+Assert-NoReparseAncestors -Path $FrontendDist
 Push-Location $FrontendDirectory
 try {
     Invoke-NativeCommand -FilePath $NpmPath -ArgumentList @('ci')
@@ -103,6 +263,7 @@ try {
     Pop-Location
 }
 
+Assert-NoReparseAncestors -Path $BrowserStage
 Invoke-NativeCommand -FilePath $PythonPath -ArgumentList @(
     '-m', 'release_tools.stage_browser',
     '--source', $BrowserSourcePath,
@@ -112,6 +273,8 @@ Invoke-NativeCommand -FilePath $PythonPath -ArgumentList @(
     '--revision', $BrowserRevision
 )
 
+Assert-NoReparseAncestors -Path $BuildDirectory
+Assert-NoReparseAncestors -Path $DistDirectory
 Remove-ContainedDirectory -Path $PyInstallerWork
 Remove-ContainedDirectory -Path $PayloadDirectory
 $env:SAU_PROJECT_ROOT = $ProjectRoot
@@ -132,9 +295,11 @@ Invoke-NativeCommand -FilePath $PythonPath -ArgumentList @(
     '--arch', 'x86_64'
 )
 
+Assert-NoReparseAncestors -Path $ReleaseDirectory
 if (-not (Test-Path -LiteralPath $ReleaseDirectory)) {
     New-Item -ItemType Directory -Path $ReleaseDirectory | Out-Null
 }
+Assert-NoReparseAncestors -Path $ReleaseDirectory
 $ReleaseItem = Get-Item -LiteralPath $ReleaseDirectory -Force
 if (-not $ReleaseItem.PSIsContainer -or ($ReleaseItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
     throw "Release path must be a real directory: $ReleaseDirectory"
@@ -145,9 +310,22 @@ if (Test-Path -LiteralPath $OutputInstaller) {
         throw "Refusing to replace a non-file or reparse point: $OutputInstaller"
     }
 }
+if (Test-Path -LiteralPath $OutputChecksum) {
+    $ExistingChecksum = Get-Item -LiteralPath $OutputChecksum -Force
+    if ($ExistingChecksum.PSIsContainer -or ($ExistingChecksum.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refusing to replace a non-file or reparse point: $OutputChecksum"
+    }
+}
 
-$TemporaryOutputDirectory = Join-Path $ReleaseDirectory ('.SocialAutoUpload-Windows-x64-Setup.' + [guid]::NewGuid().ToString('N'))
+$OutputTransactionId = [guid]::NewGuid().ToString('N')
+$TemporaryOutputDirectory = Join-Path $ReleaseDirectory ('.SocialAutoUpload-Windows-x64-Setup.' + $OutputTransactionId)
 $TemporaryInstaller = Join-Path $TemporaryOutputDirectory $InstallerName
+$TemporaryChecksum = Join-Path $TemporaryOutputDirectory $ChecksumName
+$StagedInstaller = Join-Path $ReleaseDirectory (".$InstallerName.publish-$OutputTransactionId")
+$StagedChecksum = Join-Path $ReleaseDirectory (".$ChecksumName.publish-$OutputTransactionId")
+Assert-NoReparseAncestors -Path $TemporaryOutputDirectory
+Assert-NoReparseAncestors -Path $StagedInstaller
+Assert-NoReparseAncestors -Path $StagedChecksum
 New-Item -ItemType Directory -Path $TemporaryOutputDirectory | Out-Null
 try {
     Invoke-NativeCommand -FilePath $InnoCompilerPath -ArgumentList @(
@@ -165,19 +343,28 @@ try {
     }
 
     $InstallerHash = Get-FileHash -LiteralPath $TemporaryInstaller -Algorithm SHA256
+    $ChecksumLine = $InstallerHash.Hash.ToLowerInvariant() + "  $InstallerName`r`n"
+    [IO.File]::WriteAllText($TemporaryChecksum, $ChecksumLine, [Text.Encoding]::ASCII)
+    if ((Get-Content -LiteralPath $TemporaryChecksum -Raw) -cne $ChecksumLine) {
+        throw 'Temporary installer checksum file failed its content check.'
+    }
     $Authenticode = Get-AuthenticodeSignature -FilePath $TemporaryInstaller
     Write-Host ("Installer SHA256: {0}" -f $InstallerHash.Hash.ToLowerInvariant())
     Write-Host ("Authenticode status: {0}" -f $Authenticode.Status)
 
-    if (Test-Path -LiteralPath $OutputInstaller) {
-        [IO.File]::Replace($TemporaryInstaller, $OutputInstaller, $null, $true)
-    } else {
-        Move-Item -LiteralPath $TemporaryInstaller -Destination $OutputInstaller
-    }
+    Move-Item -LiteralPath $TemporaryInstaller -Destination $StagedInstaller
+    Move-Item -LiteralPath $TemporaryChecksum -Destination $StagedChecksum
+    Remove-TemporaryDirectoryStrict -Path $TemporaryOutputDirectory
+    Publish-ArtifactPair `
+        -StagedInstaller $StagedInstaller `
+        -StagedChecksum $StagedChecksum `
+        -OutputInstaller $OutputInstaller `
+        -OutputChecksum $OutputChecksum
 } finally {
-    if (Test-Path -LiteralPath $TemporaryOutputDirectory) {
-        Remove-Item -LiteralPath $TemporaryOutputDirectory -Recurse -Force
-    }
+    Remove-PathNonFatal -Path $TemporaryOutputDirectory
+    Remove-PathNonFatal -Path $StagedInstaller
+    Remove-PathNonFatal -Path $StagedChecksum
 }
 
 Write-Host "Created Windows x64 installer: $OutputInstaller"
+Write-Host "Created Windows x64 checksum: $OutputChecksum"

@@ -544,6 +544,73 @@ class WindowsPackagingTests(unittest.TestCase):
         self.assertLess(signature_step, replace_step)
         self.assertNotIn("Remove-Item -LiteralPath $OutputInstaller", source)
 
+    def test_windows_builder_rejects_reparse_ancestors_for_every_mutable_root(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        self.assertIn("function Assert-NoReparseAncestors", source)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", source)
+        helper = source[source.index("function Assert-NoReparseAncestors"):source.index("function Get-SafeMutablePath")]
+        self.assertIn("Get-Item -LiteralPath $CurrentPath -Force -ErrorAction SilentlyContinue", helper)
+        self.assertNotIn("Test-Path -LiteralPath $CurrentPath", helper)
+        for relative_path in (
+            r"sau_frontend\dist",
+            r"sau_frontend\node_modules",
+            r"packaging\browser-stage",
+            r"build\pyinstaller-windows-x64",
+            "dist",
+            r"dist\SocialAutoUpload",
+            "release",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(
+                    f"Get-SafeMutablePath '{relative_path}'",
+                    source,
+                )
+
+    def test_windows_builder_cleans_temp_before_transactional_pair_publication(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        stage_step = source.index("$StagedInstaller")
+        strict_cleanup = source.index("Remove-TemporaryDirectoryStrict", stage_step)
+        publish_step = source.index("Publish-ArtifactPair", strict_cleanup)
+        self.assertLess(stage_step, strict_cleanup)
+        self.assertLess(strict_cleanup, publish_step)
+        self.assertIn("function Remove-PathNonFatal", source)
+        self.assertIn("Write-Warning", source[source.index("function Remove-PathNonFatal"):])
+
+    def test_windows_installer_path_ownership_preserves_raw_segments_and_rolls_back(self):
+        source = self.installer_source.read_text(encoding="utf-8")
+        self.assertIn("'OwnedPath'", source)
+        self.assertIn("RegWriteStringValue(HKCU, InstallerStateKey, 'OwnedPath', AppPath)", source)
+        self.assertIn("RegQueryStringValue(HKCU, InstallerStateKey, 'OwnedPath', OwnedPath)", source)
+        self.assertNotIn("RegWriteDWordValue", source)
+        remove_function = source[source.index("function RemovePathEntry"):source.index("procedure AddUserPath")]
+        self.assertNotIn("Trim(Copy", remove_function)
+        self.assertIn("FirstSegment", remove_function)
+        add_function = source[source.index("procedure AddUserPath"):source.index("procedure RemoveUserPath")]
+        self.assertIn("PreviousPath", add_function)
+        self.assertIn("PreviousOwnedPath", add_function)
+        self.assertIn("RemovePathEntry(PreviousPath, PreviousOwnedPath)", add_function)
+        self.assertIn("Rollback", add_function)
+        self.assertIn("if not RegWriteStringValue", add_function)
+        remove_procedure = source[source.index("procedure RemoveUserPath"):source.index("procedure CurStepChanged")]
+        self.assertIn("OwnedPath", remove_procedure)
+        self.assertNotIn("ExpandConstant('{app}')", remove_procedure)
+        self.assertIn("if not RegWriteExpandStringValue", remove_procedure)
+        self.assertIn("if not RegDeleteValue", remove_procedure)
+
+    def test_windows_builder_publishes_persistent_checksum_with_pair_rollback(self):
+        source = self.build_script.read_text(encoding="utf-8")
+        self.assertIn("$OutputChecksum", source)
+        self.assertIn("$TemporaryChecksum", source)
+        self.assertIn("$StagedChecksum", source)
+        self.assertIn("function Publish-ArtifactPair", source)
+        self.assertIn("$InstallerBackup", source)
+        self.assertIn("$ChecksumBackup", source)
+        self.assertIn("$RollbackFailed", source)
+        self.assertIn("Rollback", source)
+        self.assertIn('"  $InstallerName`r`n"', source)
+        self.assertIn("Get-Content -LiteralPath $OutputChecksum -Raw", source)
+        self.assertIn("Get-FileHash -LiteralPath $OutputInstaller -Algorithm SHA256", source)
+
 
 class MacOSPackagingTests(unittest.TestCase):
     launcher_source = Path(__file__).parents[1] / "packaging" / "macos" / "launcher"

@@ -94,57 +94,128 @@ var
   Remaining: String;
   Segment: String;
   Separator: Integer;
+  HasMore: Boolean;
+  FirstSegment: Boolean;
+  Removed: Boolean;
 begin
   Result := '';
-  Remaining := PathValue + ';';
-  while Length(Remaining) > 0 do
+  Remaining := PathValue;
+  FirstSegment := True;
+  Removed := False;
+  while True do
   begin
     Separator := Pos(';', Remaining);
-    Segment := Trim(Copy(Remaining, 1, Separator - 1));
-    Delete(Remaining, 1, Separator);
-    if (Segment <> '') and
-       (CompareText(NormalizePathEntry(Segment), NormalizePathEntry(Entry)) <> 0) then
+    HasMore := Separator > 0;
+    if HasMore then
     begin
-      if Result <> '' then
+      Segment := Copy(Remaining, 1, Separator - 1);
+      Delete(Remaining, 1, Separator);
+    end
+    else
+    begin
+      Segment := Remaining;
+      Remaining := '';
+    end;
+    if (not Removed) and
+       (CompareText(NormalizePathEntry(Segment), NormalizePathEntry(Entry)) = 0) then
+      Removed := True
+    else
+    begin
+      if not FirstSegment then
         Result := Result + ';';
       Result := Result + Segment;
+      FirstSegment := False;
     end;
+    if not HasMore then
+      Break;
   end;
+end;
+
+function RollbackUserPath(const PathExisted: Boolean; const PreviousPath: String): Boolean;
+begin
+  if PathExisted then
+    Result := RegWriteExpandStringValue(HKCU, UserEnvironmentKey, 'Path', PreviousPath)
+  else
+    Result := RegDeleteValue(HKCU, UserEnvironmentKey, 'Path');
 end;
 
 procedure AddUserPath;
 var
-  ExistingPath: String;
+  PreviousPath: String;
+  PreviousOwnedPath: String;
+  UpdatedPath: String;
   AppPath: String;
+  PathExisted: Boolean;
+  PreviousOwnershipExisted: Boolean;
 begin
   AppPath := ExpandConstant('{app}');
-  if not RegQueryStringValue(HKCU, UserEnvironmentKey, 'Path', ExistingPath) then
-    ExistingPath := '';
-  if PathContains(ExistingPath, AppPath) then
+  PathExisted := RegQueryStringValue(HKCU, UserEnvironmentKey, 'Path', PreviousPath);
+  if not PathExisted then
+    PreviousPath := '';
+  PreviousOwnershipExisted := RegQueryStringValue(
+    HKCU, InstallerStateKey, 'OwnedPath', PreviousOwnedPath
+  );
+  if PreviousOwnershipExisted and
+     (CompareText(NormalizePathEntry(PreviousOwnedPath), NormalizePathEntry(AppPath)) = 0) and
+     PathContains(PreviousPath, AppPath) then
     Exit;
-  if ExistingPath = '' then
-    ExistingPath := AppPath
+
+  UpdatedPath := PreviousPath;
+  if PreviousOwnershipExisted then
+    UpdatedPath := RemovePathEntry(PreviousPath, PreviousOwnedPath);
+
+  if PathContains(UpdatedPath, AppPath) then
+  begin
+    if UpdatedPath <> PreviousPath then
+    begin
+      if not RegWriteExpandStringValue(HKCU, UserEnvironmentKey, 'Path', UpdatedPath) then
+        RaiseException('Unable to remove the prior installer-owned PATH entry.');
+    end;
+    if PreviousOwnershipExisted then
+    begin
+      if not RegDeleteValue(HKCU, InstallerStateKey, 'OwnedPath') then
+      begin
+        if not RollbackUserPath(PathExisted, PreviousPath) then
+          RaiseException('Unable to clear old PATH ownership and PATH rollback failed.');
+        RaiseException('Unable to clear old PATH ownership; the PATH update was rolled back.');
+      end;
+    end;
+    Exit;
+  end;
+
+  if UpdatedPath = '' then
+    UpdatedPath := AppPath
   else
-    ExistingPath := ExistingPath + ';' + AppPath;
-  if not RegWriteExpandStringValue(HKCU, UserEnvironmentKey, 'Path', ExistingPath) then
+    UpdatedPath := UpdatedPath + ';' + AppPath;
+  if not RegWriteExpandStringValue(HKCU, UserEnvironmentKey, 'Path', UpdatedPath) then
     RaiseException('Unable to update the user PATH.');
-  RegWriteDWordValue(HKCU, InstallerStateKey, 'AddedToPath', 1);
+  if not RegWriteStringValue(HKCU, InstallerStateKey, 'OwnedPath', AppPath) then
+  begin
+    if not RollbackUserPath(PathExisted, PreviousPath) then
+      RaiseException('Unable to record PATH ownership and PATH rollback failed.');
+    RaiseException('Unable to record PATH ownership; the PATH update was rolled back.');
+  end;
 end;
 
 procedure RemoveUserPath;
 var
-  Added: Cardinal;
+  OwnedPath: String;
   ExistingPath: String;
+  UpdatedPath: String;
 begin
-  if not RegQueryDWordValue(HKCU, InstallerStateKey, 'AddedToPath', Added) or
-     (Added <> 1) then
+  if not RegQueryStringValue(HKCU, InstallerStateKey, 'OwnedPath', OwnedPath) then
     Exit;
   if RegQueryStringValue(HKCU, UserEnvironmentKey, 'Path', ExistingPath) then
-    RegWriteExpandStringValue(
-      HKCU, UserEnvironmentKey, 'Path',
-      RemovePathEntry(ExistingPath, ExpandConstant('{app}'))
-    );
-  RegDeleteValue(HKCU, InstallerStateKey, 'AddedToPath');
+  begin
+    UpdatedPath := RemovePathEntry(ExistingPath, OwnedPath);
+    if UpdatedPath <> ExistingPath then
+    begin
+      if not RegWriteExpandStringValue(HKCU, UserEnvironmentKey, 'Path', UpdatedPath) then
+        RaiseException('Unable to remove the installer-owned user PATH entry.');
+    end;
+  end;
+  if not RegDeleteValue(HKCU, InstallerStateKey, 'OwnedPath') then
+    RaiseException('Unable to delete the installer PATH ownership marker.');
   RegDeleteKeyIfEmpty(HKCU, InstallerStateKey);
 end;
 
